@@ -3,67 +3,153 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zinrai Live</title>
-<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<title>Live Stream</title>
+<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #0e0e0e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: -apple-system, sans-serif; color: #fff; }
   .player-wrap { position: relative; width: 100%; max-width: 1280px; }
   video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
-  #unmute-btn { position: absolute; bottom: 16px; right: 16px; background: rgba(0,0,0,0.75); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; display: none; }
-  #unmute-btn:hover { background: rgba(40,40,40,0.9); }
-  #status { margin-top: 10px; font-size: 13px; color: #888; }
+  #status { margin-top: 10px; font-size: 13px; color: #888; text-align: center; }
+  #error  { margin-top: 8px; font-size: 12px; color: #e55; text-align: center; display: none; }
 </style>
 </head>
 <body>
 <div class="player-wrap">
-  <video id="video" autoplay playsinline></video>
-  <button id="unmute-btn" onclick="enableAudio()">Click to enable audio</button>
+  <video id="video" autoplay playsinline controls></video>
 </div>
 <div id="status">Connecting...</div>
+<div id="error"></div>
+
 <script>
-// Generate a viewer token with scripts/generate-token.py and paste here
-// Token expires — regenerate when it does (see scripts/generate-token.py)
-const WS_URL = 'wss://livestream.zinrai.live';
-const TOKEN  = 'YOUR_VIEWER_JWT_TOKEN';
+(function () {
+  // Read stream key and one-time token from URL params
+  // Example: /player?stream=abc123&token=xyz789
+  const params     = new URLSearchParams(window.location.search);
+  const streamKey  = params.get('stream');
+  const token      = params.get('token');
+  const statusEl   = document.getElementById('status');
+  const errorEl    = document.getElementById('error');
+  const video      = document.getElementById('video');
 
-const video     = document.getElementById('video');
-const statusEl  = document.getElementById('status');
-const unmuteBtn = document.getElementById('unmute-btn');
-
-const room = new LivekitClient.Room({
-  adaptiveStream: false,  // always use highest quality, no quality switching
-  dynacast: false,
-  reconnectPolicy: { maxRetries: 20 },
-});
-
-async function enableAudio() {
-  await room.startAudio();
-  unmuteBtn.style.display = 'none';
-}
-
-room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
-  unmuteBtn.style.display = room.canPlaybackAudio ? 'none' : 'block';
-});
-
-room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
-  if (track.kind === LivekitClient.Track.Kind.Video) {
-    track.attach(video);
-    statusEl.textContent = 'LIVE - WebRTC';
+  if (!streamKey) {
+    statusEl.textContent = 'No stream specified.';
+    errorEl.textContent  = 'Add ?stream=YOUR_STREAM_KEY&token=YOUR_TOKEN to the URL.';
+    errorEl.style.display = 'block';
+    return;
   }
-  if (track.kind === LivekitClient.Track.Kind.Audio) {
-    document.body.appendChild(track.attach());
+
+  // Build FLV URL — token passed as query param for SRS on_play auth
+  const host   = window.location.host;
+  const proto  = window.location.protocol;
+  const flvUrl = token
+    ? `${proto}//${host}/live/${streamKey}.flv?token=${token}`
+    : `${proto}//${host}/live/${streamKey}.flv`;
+
+  let player       = null;
+  let retryCount   = 0;
+  let retryTimer   = null;
+  const MAX_RETRY  = 20;
+  const BASE_DELAY = 2000; // ms
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function setError(msg)  { errorEl.textContent = msg; errorEl.style.display = msg ? 'block' : 'none'; }
+
+  function destroy() {
+    if (player) {
+      try { player.pause(); player.unload(); player.detachMediaElement(); player.destroy(); } catch (_) {}
+      player = null;
+    }
   }
-});
 
-room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => { track.detach(); statusEl.textContent = 'Stream ended'; });
-room.on(LivekitClient.RoomEvent.Disconnected,      () => { statusEl.textContent = 'Disconnected - reconnecting...'; });
-room.on(LivekitClient.RoomEvent.Reconnecting,      () => { statusEl.textContent = 'Reconnecting...'; });
-room.on(LivekitClient.RoomEvent.Reconnected,       () => { statusEl.textContent = 'LIVE - Reconnected'; });
+  function connect() {
+    destroy();
 
-room.connect(WS_URL, TOKEN)
-  .then(() => { statusEl.textContent = 'Connected - waiting for stream...'; })
-  .catch(err => { statusEl.textContent = 'Error: ' + err.message; });
+    if (!flvjs.isSupported()) {
+      setStatus('Your browser does not support HTTP-FLV.');
+      return;
+    }
+
+    player = flvjs.createPlayer({
+      type:         'flv',
+      url:          flvUrl,
+      isLive:       true,
+      hasAudio:     true,
+      hasVideo:     true,
+      cors:         true,
+    }, {
+      enableWorker:              true,
+      lazyLoadMaxDuration:       3 * 60,
+      seekType:                  'range',
+      liveBufferLatencyChasing:  true,
+      liveBufferLatencyMaxLatency: 1.5,
+      liveBufferLatencyMinRemain:  0.3,
+    });
+
+    player.attachMediaElement(video);
+
+    player.on(flvjs.Events.ERROR, function (errType, errDetail) {
+      console.warn('FLV error', errType, errDetail);
+
+      if (errType === flvjs.ErrorTypes.NETWORK_ERROR) {
+        setStatus('Stream not available — retrying...');
+        scheduleRetry();
+      } else if (errType === flvjs.ErrorTypes.MEDIA_ERROR) {
+        setStatus('Media error — retrying...');
+        scheduleRetry();
+      } else {
+        setError('Fatal error: ' + errType);
+        setStatus('Playback failed.');
+      }
+    });
+
+    player.on(flvjs.Events.STATISTICS_INFO, function (stats) {
+      if (stats.speed > 0) {
+        setStatus('LIVE  |  ' + Math.round(stats.speed) + ' KB/s');
+        setError('');
+        retryCount = 0; // reset on successful data
+      }
+    });
+
+    player.on(flvjs.Events.MEDIA_INFO, function () {
+      setStatus('LIVE — stream active');
+      setError('');
+    });
+
+    try {
+      player.load();
+      player.play();
+    } catch (e) {
+      scheduleRetry();
+    }
+  }
+
+  function scheduleRetry() {
+    if (retryTimer) return;
+    if (retryCount >= MAX_RETRY) {
+      setStatus('Stream unavailable after ' + MAX_RETRY + ' retries.');
+      return;
+    }
+    const delay = Math.min(BASE_DELAY * Math.pow(1.5, retryCount), 30000);
+    retryCount++;
+    setStatus('Retrying in ' + Math.round(delay / 1000) + 's... (' + retryCount + '/' + MAX_RETRY + ')');
+    retryTimer = setTimeout(function () {
+      retryTimer = null;
+      connect();
+    }, delay);
+  }
+
+  // Start
+  connect();
+
+  // Reconnect when tab becomes visible again
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && (!player || video.paused)) {
+      retryCount = 0;
+      connect();
+    }
+  });
+})();
 </script>
 </body>
 </html>
