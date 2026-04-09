@@ -208,17 +208,15 @@ async def on_play(request: Request):
     if not entry:
         return srs_deny("Invalid token")
 
-    if entry["used"]:
-        return srs_deny("Token already used")
-
     if entry["expires_at"] < time.time():
+        viewer_tokens.pop(token, None)
         return srs_deny("Token expired")
 
     if entry["stream_key"] and entry["stream_key"] != stream_key:
         return srs_deny(f"Token not valid for stream {stream_key}")
 
-    # Mark as used — one-time only
-    entry["used"] = True
+    # Token is time-limited (not one-time) — allows WebRTC ICE restarts
+    # and reconnects within the token TTL without requiring a new token.
     log.info(f"Viewer authenticated: stream={stream_key} client={client_id}")
     return srs_ok()
 
@@ -354,7 +352,6 @@ def generate_token(stream_key: str):
     token = secrets.token_urlsafe(32)
     viewer_tokens[token] = {
         "stream_key": stream_key,
-        "used":       False,
         "expires_at": time.time() + TOKEN_TTL,
         "created_at": time.time(),
     }

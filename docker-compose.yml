@@ -8,6 +8,7 @@ services:
       - "1935:1935"
       - "1985:1985"
       - "8080:8080"
+      - "8000:8000/udp"   # WebRTC media (SRTP)
     volumes:
       - ./srs/origin.conf:/usr/local/srs/conf/srs.conf
       - srs-dvr:/dvr

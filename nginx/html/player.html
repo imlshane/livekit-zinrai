@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live Stream</title>
-<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #0e0e0e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: -apple-system, sans-serif; color: #fff; }
@@ -16,139 +15,159 @@
 </head>
 <body>
 <div class="player-wrap">
-  <video id="video" autoplay playsinline controls></video>
+  <video id="video" autoplay playsinline></video>
 </div>
 <div id="status">Connecting...</div>
 <div id="error"></div>
 
 <script>
 (function () {
-  // Read stream key and one-time token from URL params
-  // Example: /player?stream=abc123&token=xyz789
-  const params     = new URLSearchParams(window.location.search);
-  const streamKey  = params.get('stream');
-  const token      = params.get('token');
-  const statusEl   = document.getElementById('status');
-  const errorEl    = document.getElementById('error');
-  const video      = document.getElementById('video');
-
-  if (!streamKey) {
-    statusEl.textContent = 'No stream specified.';
-    errorEl.textContent  = 'Add ?stream=YOUR_STREAM_KEY&token=YOUR_TOKEN to the URL.';
-    errorEl.style.display = 'block';
-    return;
-  }
-
-  // Build FLV URL — token passed as query param for SRS on_play auth
-  const host   = window.location.host;
-  const proto  = window.location.protocol;
-  const flvUrl = token
-    ? `${proto}//${host}/live/${streamKey}.flv?token=${token}`
-    : `${proto}//${host}/live/${streamKey}.flv`;
-
-  let player       = null;
-  let retryCount   = 0;
-  let retryTimer   = null;
-  const MAX_RETRY  = 20;
-  const BASE_DELAY = 2000; // ms
+  var params    = new URLSearchParams(window.location.search);
+  var streamKey = params.get('stream');
+  var token     = params.get('token');
+  var statusEl  = document.getElementById('status');
+  var errorEl   = document.getElementById('error');
+  var video     = document.getElementById('video');
 
   function setStatus(msg) { statusEl.textContent = msg; }
   function setError(msg)  { errorEl.textContent = msg; errorEl.style.display = msg ? 'block' : 'none'; }
 
-  function destroy() {
-    if (player) {
-      try { player.pause(); player.unload(); player.detachMediaElement(); player.destroy(); } catch (_) {}
-      player = null;
-    }
+  if (!streamKey) {
+    setStatus('No stream specified.');
+    setError('Add ?stream=YOUR_STREAM_KEY&token=YOUR_TOKEN to the URL.');
+    return;
   }
 
-  function connect() {
-    destroy();
+  if (!window.RTCPeerConnection) {
+    setStatus('WebRTC not supported in this browser.');
+    return;
+  }
 
-    if (!flvjs.isSupported()) {
-      setStatus('Your browser does not support HTTP-FLV.');
+  var pc          = null;
+  var retryCount  = 0;
+  var retryTimer  = null;
+  var MAX_RETRY   = 30;
+  var connected   = false;
+
+  function whepUrl() {
+    var base = window.location.protocol + '//' + window.location.host;
+    var url  = base + '/rtc/v1/whep/?app=live&stream=' + streamKey;
+    if (token) url += '&token=' + token;
+    return url;
+  }
+
+  function scheduleRetry(delaySec) {
+    if (retryTimer) return;
+    if (retryCount >= MAX_RETRY) {
+      setStatus('Stream unavailable. Refresh the page to try again.');
+      return;
+    }
+    var delay = delaySec || Math.min(2000 * Math.pow(1.5, retryCount), 20000);
+    retryCount++;
+    setStatus('Waiting for stream... (' + retryCount + '/' + MAX_RETRY + ')');
+    retryTimer = setTimeout(function () { retryTimer = null; connect(); }, delay);
+  }
+
+  function cleanup() {
+    if (pc) {
+      pc.oniceconnectionstatechange = null;
+      pc.ontrack = null;
+      try { pc.close(); } catch (_) {}
+      pc = null;
+    }
+    video.srcObject = null;
+    connected = false;
+  }
+
+  async function connect() {
+    cleanup();
+
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      bundlePolicy: 'max-bundle',
+    });
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    pc.ontrack = function (e) {
+      if (e.streams && e.streams[0]) {
+        video.srcObject = e.streams[0];
+      }
+    };
+
+    pc.oniceconnectionstatechange = function () {
+      var state = pc ? pc.iceConnectionState : 'closed';
+      if (state === 'connected' || state === 'completed') {
+        connected = true;
+        retryCount = 0;
+        setStatus('LIVE — WebRTC');
+        setError('');
+      } else if (state === 'disconnected') {
+        setStatus('Connection dropped — reconnecting...');
+        scheduleRetry(3000);
+      } else if (state === 'failed' || state === 'closed') {
+        setStatus('Connection failed — retrying...');
+        scheduleRetry();
+      }
+    };
+
+    var offer;
+    try {
+      offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+    } catch (e) {
+      setStatus('Failed to create offer.');
+      setError(e.message);
+      scheduleRetry();
       return;
     }
 
-    player = flvjs.createPlayer({
-      type:         'flv',
-      url:          flvUrl,
-      isLive:       true,
-      hasAudio:     true,
-      hasVideo:     true,
-      cors:         true,
-    }, {
-      enableWorker:              true,
-      lazyLoadMaxDuration:       3 * 60,
-      seekType:                  'range',
-      liveBufferLatencyChasing:  true,
-      liveBufferLatencyMaxLatency: 1.5,
-      liveBufferLatencyMinRemain:  0.3,
-    });
-
-    player.attachMediaElement(video);
-
-    player.on(flvjs.Events.ERROR, function (errType, errDetail) {
-      console.warn('FLV error', errType, errDetail);
-
-      if (errType === flvjs.ErrorTypes.NETWORK_ERROR) {
-        setStatus('Stream not available — retrying...');
-        scheduleRetry();
-      } else if (errType === flvjs.ErrorTypes.MEDIA_ERROR) {
-        setStatus('Media error — retrying...');
-        scheduleRetry();
-      } else {
-        setError('Fatal error: ' + errType);
-        setStatus('Playback failed.');
-      }
-    });
-
-    player.on(flvjs.Events.STATISTICS_INFO, function (stats) {
-      if (stats.speed > 0) {
-        setStatus('LIVE  |  ' + Math.round(stats.speed) + ' KB/s');
-        setError('');
-        retryCount = 0; // reset on successful data
-      }
-    });
-
-    player.on(flvjs.Events.MEDIA_INFO, function () {
-      setStatus('LIVE — stream active');
-      setError('');
-    });
-
+    // POST SDP offer to SRS WHEP endpoint
+    var resp;
     try {
-      player.load();
-      player.play();
+      resp = await fetch(whepUrl(), {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body:    offer.sdp,
+      });
     } catch (e) {
+      // Network error — stream likely not started yet
+      scheduleRetry();
+      return;
+    }
+
+    if (resp.status === 403) {
+      setStatus('Access denied.');
+      setError('Token invalid or expired. Refresh the page to get a new link.');
+      return;  // do NOT retry — token issue, not a stream issue
+    }
+
+    if (!resp.ok) {
+      // 404 = stream not started yet, keep retrying
+      scheduleRetry();
+      return;
+    }
+
+    var answerSdp = await resp.text();
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    } catch (e) {
+      setStatus('SDP negotiation failed.');
+      setError(e.message);
       scheduleRetry();
     }
   }
 
-  function scheduleRetry() {
-    if (retryTimer) return;
-    if (retryCount >= MAX_RETRY) {
-      setStatus('Stream unavailable after ' + MAX_RETRY + ' retries.');
-      return;
-    }
-    const delay = Math.min(BASE_DELAY * Math.pow(1.5, retryCount), 30000);
-    retryCount++;
-    setStatus('Retrying in ' + Math.round(delay / 1000) + 's... (' + retryCount + '/' + MAX_RETRY + ')');
-    retryTimer = setTimeout(function () {
-      retryTimer = null;
-      connect();
-    }, delay);
-  }
-
-  // Start
-  connect();
-
   // Reconnect when tab becomes visible again
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden && (!player || video.paused)) {
+    if (!document.hidden && !connected && !retryTimer) {
       retryCount = 0;
       connect();
     }
   });
+
+  connect();
 })();
 </script>
 </body>
