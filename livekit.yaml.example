@@ -7,13 +7,20 @@ rtc:
   port_range_start: 50000
   port_range_end: 51000
   use_external_ip: true
-  node_ip: YOUR_SERVER_PUBLIC_IP   # e.g. 1.2.3.4
+  node_ip: YOUR_SERVER_PUBLIC_IP
 
 keys:
-  YOUR_API_KEY: YOUR_API_SECRET    # generate with: openssl rand -hex 32
+  YOUR_API_KEY: YOUR_API_SECRET
 
+# --- Option A: DO Managed Redis (recommended) ---
 redis:
-  address: 127.0.0.1:6379
+  address: YOUR_DO_REDIS_HOST:25061
+  password: YOUR_DO_REDIS_PASSWORD
+  use_tls: true
+
+# --- Option B: Local Redis container ---
+# redis:
+#   address: 127.0.0.1:6379
 
 logging:
   level: info

@@ -1,12 +1,5 @@
 services:
 
-  redis:
-    image: redis:7-alpine
-    container_name: livekit-redis
-    restart: unless-stopped
-    network_mode: host
-    command: redis-server --bind 127.0.0.1 --port 6379
-
   livekit:
     image: livekit/livekit-server:latest
     container_name: livekit
@@ -15,8 +8,6 @@ services:
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml
     command: --config /etc/livekit.yaml
-    depends_on:
-      - redis
 
   ingress:
     image: livekit/ingress:latest
@@ -29,7 +20,6 @@ services:
       - INGRESS_CONFIG_FILE=/etc/ingress.yaml
     depends_on:
       - livekit
-      - redis
 
   nginx:
     image: nginx:alpine

@@ -1,0 +1,26 @@
+[Unit]
+Description=Zinrai LiveKit Streaming Stack
+Documentation=https://github.com/imlshane/livekit-zinrai
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/livekit
+
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart
+
+# Give containers time to start/stop cleanly
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=livekit
+
+[Install]
+WantedBy=multi-user.target
