@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Install livekit.service as a systemd unit so the stack
-# starts automatically on boot and can be managed with systemctl.
+# Install srs.service as a systemd unit so the stack starts automatically
+# on boot and can be managed with systemctl.
 #
-# Run from /opt/livekit after git clone:
+# Run as root from your deploy directory (e.g. /opt/livekit):
 #   bash scripts/install-service.sh
 
 set -euo pipefail
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVICE_FILE="$INSTALL_DIR/livekit.service"
-SYSTEMD_DEST="/etc/systemd/system/livekit.service"
+SERVICE_FILE="$INSTALL_DIR/srs.service"
+SYSTEMD_DEST="/etc/systemd/system/srs-stream.service"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "✗ Run as root: sudo bash scripts/install-service.sh"
@@ -21,14 +21,14 @@ sed "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|" \
   "$SERVICE_FILE" > "$SYSTEMD_DEST"
 
 systemctl daemon-reload
-systemctl enable livekit
-systemctl start  livekit
+systemctl enable srs-stream
+systemctl start  srs-stream
 
 echo ""
-echo "✓ livekit.service installed and started."
+echo "✓ srs-stream.service installed and started."
 echo ""
-echo "  systemctl status  livekit   # check status"
-echo "  systemctl restart livekit   # restart all containers"
-echo "  systemctl stop    livekit   # stop all containers"
-echo "  systemctl start   livekit   # start all containers"
-echo "  journalctl -u livekit -f    # follow logs"
+echo "  systemctl status  srs-stream   # check status"
+echo "  systemctl restart srs-stream   # restart all containers"
+echo "  systemctl stop    srs-stream   # stop all containers"
+echo "  systemctl start   srs-stream   # start all containers"
+echo "  journalctl -u srs-stream -f    # follow logs"
