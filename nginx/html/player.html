@@ -49,11 +49,15 @@
   var MAX_RETRY   = 30;
   var connected   = false;
 
-  function whepUrl() {
-    var base = window.location.protocol + '//' + window.location.host;
-    var url  = base + '/rtc/v1/whep/?app=live&stream=' + streamKey;
-    if (token) url += '&token=' + token;
+  // SRS5 uses proprietary JSON API at /rtc/v1/play/ (not WHEP which is SRS6+)
+  function rtcPlayUrl() {
+    var url = '/rtc/v1/play/';
+    if (token) url += '?token=' + token;
     return url;
+  }
+
+  function streamUrl() {
+    return 'webrtc://' + window.location.host + '/live/' + streamKey;
   }
 
   function scheduleRetry(delaySec) {
@@ -123,35 +127,35 @@
       return;
     }
 
-    // POST SDP offer to SRS WHEP endpoint
-    var resp;
+    // POST SDP offer to SRS /rtc/v1/play/ (SRS5 proprietary JSON API)
+    var result;
     try {
-      resp = await fetch(whepUrl(), {
+      var resp = await fetch(rtcPlayUrl(), {
         method:  'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body:    offer.sdp,
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ sdp: offer.sdp, streamurl: streamUrl() }),
       });
+      result = await resp.json();
     } catch (e) {
-      // Network error — stream likely not started yet
+      // Network error or stream not started yet
       scheduleRetry();
       return;
     }
 
-    if (resp.status === 403) {
+    if (result.code === 401 || result.code === 403) {
       setStatus('Access denied.');
-      setError('Token invalid or expired. Refresh the page to get a new link.');
-      return;  // do NOT retry — token issue, not a stream issue
+      setError('Token invalid or expired. Get a new link from the host.');
+      return;  // do NOT retry on auth failure
     }
 
-    if (!resp.ok) {
-      // 404 = stream not started yet, keep retrying
+    if (result.code !== 0) {
+      // Non-zero code = stream not ready yet (404) or other transient error
       scheduleRetry();
       return;
     }
 
-    var answerSdp = await resp.text();
     try {
-      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+      await pc.setRemoteDescription({ type: 'answer', sdp: result.sdp });
     } catch (e) {
       setStatus('SDP negotiation failed.');
       setError(e.message);
