@@ -1,0 +1,23 @@
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 51000
+  use_external_ip: true
+  node_ip: YOUR_SERVER_PUBLIC_IP   # e.g. 1.2.3.4
+
+keys:
+  YOUR_API_KEY: YOUR_API_SECRET    # generate with: openssl rand -hex 32
+
+redis:
+  address: 127.0.0.1:6379
+
+logging:
+  level: info
+
+room:
+  empty_timeout: 300
+  departure_timeout: 20

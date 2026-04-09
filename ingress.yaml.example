@@ -1,0 +1,10 @@
+api_key: YOUR_API_KEY        # must match livekit.yaml keys
+api_secret: YOUR_API_SECRET  # must match livekit.yaml keys
+ws_url: ws://localhost:7880
+rtmp:
+  port: 1935
+logging:
+  level: info
+
+redis:
+  address: 127.0.0.1:6379

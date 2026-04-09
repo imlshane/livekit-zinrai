@@ -1,0 +1,13 @@
+# Secret config files — copy from .example and fill in real values
+livekit.yaml
+ingress.yaml
+.env
+
+# Keys/secrets
+*.key
+*.secret
+.keys/
+
+# OS
+.DS_Store
+Thumbs.db

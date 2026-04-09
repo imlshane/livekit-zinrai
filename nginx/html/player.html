@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zinrai Live</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0e0e0e; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: -apple-system, sans-serif; color: #fff; }
+  .player-wrap { position: relative; width: 100%; max-width: 1280px; }
+  video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
+  #unmute-btn { position: absolute; bottom: 16px; right: 16px; background: rgba(0,0,0,0.75); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; display: none; }
+  #unmute-btn:hover { background: rgba(40,40,40,0.9); }
+  #status { margin-top: 10px; font-size: 13px; color: #888; }
+</style>
+</head>
+<body>
+<div class="player-wrap">
+  <video id="video" autoplay playsinline></video>
+  <button id="unmute-btn" onclick="enableAudio()">Click to enable audio</button>
+</div>
+<div id="status">Connecting...</div>
+<script>
+// Generate a viewer token with scripts/generate-token.py and paste here
+// Token expires — regenerate when it does (see scripts/generate-token.py)
+const WS_URL = 'wss://YOUR_DOMAIN';
+const TOKEN  = 'YOUR_VIEWER_JWT_TOKEN';
+
+const video     = document.getElementById('video');
+const statusEl  = document.getElementById('status');
+const unmuteBtn = document.getElementById('unmute-btn');
+
+const room = new LivekitClient.Room({
+  adaptiveStream: false,  // always use highest quality, no quality switching
+  dynacast: false,
+  reconnectPolicy: { maxRetries: 20 },
+});
+
+async function enableAudio() {
+  await room.startAudio();
+  unmuteBtn.style.display = 'none';
+}
+
+room.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
+  unmuteBtn.style.display = room.canPlaybackAudio ? 'none' : 'block';
+});
+
+room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+  if (track.kind === LivekitClient.Track.Kind.Video) {
+    track.attach(video);
+    statusEl.textContent = 'LIVE - WebRTC';
+  }
+  if (track.kind === LivekitClient.Track.Kind.Audio) {
+    document.body.appendChild(track.attach());
+  }
+});
+
+room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => { track.detach(); statusEl.textContent = 'Stream ended'; });
+room.on(LivekitClient.RoomEvent.Disconnected,      () => { statusEl.textContent = 'Disconnected - reconnecting...'; });
+room.on(LivekitClient.RoomEvent.Reconnecting,      () => { statusEl.textContent = 'Reconnecting...'; });
+room.on(LivekitClient.RoomEvent.Reconnected,       () => { statusEl.textContent = 'LIVE - Reconnected'; });
+
+room.connect(WS_URL, TOKEN)
+  .then(() => { statusEl.textContent = 'Connected - waiting for stream...'; })
+  .catch(err => { statusEl.textContent = 'Error: ' + err.message; });
+</script>
+</body>
+</html>
