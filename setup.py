@@ -387,8 +387,9 @@ def update_player_token(cfg: dict):
     import re
     html = re.sub(r"const TOKEN\s*=\s*'[^']*'",
                   f"const TOKEN  = '{token}'", html)
-    html = re.sub(r'const WS_URL\s*=\s*\'[^\']*\'',
-                  f"const WS_URL = 'wss://{cfg[\"domain\"]}'", html)
+    domain = cfg["domain"]
+    html = re.sub(r"const WS_URL\s*=\s*'[^']*'",
+                  f"const WS_URL = 'wss://{domain}'", html)
     player_path.write_text(html)
     print(f"  ✓ Token injected into nginx/html/player.html")
     print(f"    expires : {time.strftime('%Y-%m-%d', time.localtime(time.time() + 30*86400))}")
