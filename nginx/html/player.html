@@ -11,11 +11,26 @@
   video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
   #status { margin-top: 10px; font-size: 13px; color: #888; text-align: center; }
   #error  { margin-top: 8px; font-size: 12px; color: #e55; text-align: center; display: none; }
+  #unmute-overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.6); cursor: pointer; gap: 12px;
+  }
+  #unmute-overlay svg { width: 56px; height: 56px; fill: #fff; opacity: 0.9; }
+  #unmute-overlay span { font-size: 15px; color: #fff; opacity: 0.85; }
+  #unmute-overlay.hidden { display: none; }
 </style>
 </head>
 <body>
 <div class="player-wrap">
-  <video id="video" autoplay playsinline></video>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="unmute-overlay" class="hidden">
+    <!-- Speaker icon -->
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+    </svg>
+    <span>Click to enable audio</span>
+  </div>
 </div>
 <div id="status">Connecting...</div>
 <div id="error"></div>
@@ -43,11 +58,18 @@
     return;
   }
 
+  var overlay     = document.getElementById('unmute-overlay');
   var pc          = null;
   var retryCount  = 0;
   var retryTimer  = null;
   var MAX_RETRY   = 30;
   var connected   = false;
+
+  // Click overlay → unmute and hide it
+  overlay.addEventListener('click', function () {
+    video.muted = false;
+    overlay.classList.add('hidden');
+  });
 
   // SRS5 uses proprietary JSON API at /rtc/v1/play/ (not WHEP which is SRS6+)
   function rtcPlayUrl() {
@@ -97,6 +119,13 @@
     pc.ontrack = function (e) {
       if (e.streams && e.streams[0]) {
         video.srcObject = e.streams[0];
+        // Start muted (browser autoplay policy) then show overlay for unmute
+        video.muted = true;
+        video.play().then(function () {
+          overlay.classList.remove('hidden');
+        }).catch(function () {
+          overlay.classList.remove('hidden');
+        });
       }
     };
 
