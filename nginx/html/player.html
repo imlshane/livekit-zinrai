@@ -73,13 +73,14 @@
 
   // SRS5 uses proprietary JSON API at /rtc/v1/play/ (not WHEP which is SRS6+)
   function rtcPlayUrl() {
-    var url = '/rtc/v1/play/';
-    if (token) url += '?token=' + token;
-    return url;
+    return '/rtc/v1/play/';
   }
 
   function streamUrl() {
-    return 'webrtc://' + window.location.host + '/live/' + streamKey;
+    // Token must be in streamurl — SRS uses this for on_play param, not the HTTP URL
+    var url = 'webrtc://' + window.location.host + '/live/' + streamKey;
+    if (token) url += '?token=' + token;
+    return url;
   }
 
   function scheduleRetry(delaySec) {
