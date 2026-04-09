@@ -19,6 +19,9 @@ services:
     build: ./auth
     container_name: srs-auth
     restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.20.0.2   # fixed IP — referenced in srs/origin.conf http_hooks
     environment:
       - DATABASE_URL=sqlite:////data/auth.db
       - SECRET_KEY=${SECRET_KEY:-local-dev-secret-change-in-prod}
@@ -49,3 +52,9 @@ services:
 volumes:
   srs-dvr:
   auth-db:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
