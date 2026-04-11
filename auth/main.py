@@ -49,6 +49,7 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 # Recordings platform — push stream events in real-time
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
+SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
 
 MAX_PUBLISHERS = 100
 TOKEN_TTL      = 3600  # seconds — how long a viewer token is valid to start playing
@@ -140,6 +141,59 @@ def fire(path: str, payload: dict) -> None:
     """Schedule push_event as a background task (non-blocking)."""
     asyncio.create_task(push_event(path, payload))
 
+
+async def restore_active_streams() -> None:
+    """
+    On startup, query the SRS API to rebuild active_streams from live publisher clients.
+    Prevents zero-state after an auth service restart while streams are running.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{SRS_API_URL}/api/v1/clients/")
+            if not resp.is_success:
+                log.warning(f"⚠️  Could not query SRS API for state recovery: HTTP {resp.status_code}")
+                return
+
+            data = resp.json()
+            clients = data.get("clients", [])
+
+        db = get_db()
+        try:
+            restored = 0
+            for c in clients:
+                if not c.get("publish"):
+                    continue  # skip viewers, only care about publishers
+
+                stream_key = c.get("name", "")
+                client_id  = c.get("id", "")
+                if not stream_key or stream_key in active_streams:
+                    continue
+
+                # Look up publisher username from DB
+                publisher = db.query(Publisher).filter_by(stream_key=stream_key, enabled=True).first()
+                if not publisher:
+                    continue
+
+                active_streams[stream_key] = {
+                    "started_at": time.time(),  # exact start unknown after restart
+                    "client_id":  client_id,
+                    "app":        "live",
+                    "username":   publisher.username,
+                }
+                log.info(f"♻️  Restored stream: {stream_key} by {publisher.username} (client={client_id})")
+                restored += 1
+        finally:
+            db.close()
+
+        if restored:
+            log.info(f"♻️  State recovery complete — {restored} active stream(s) restored")
+        else:
+            log.info("♻️  State recovery: no active publisher streams found in SRS")
+
+    except Exception as e:
+        log.warning(f"⚠️  State recovery failed (non-fatal): {e}")
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -150,6 +204,9 @@ async def lifespan(app: FastAPI):
         seed_test_data(db)
     finally:
         db.close()
+
+    # Restore active_streams from SRS API (handles auth restarts while streams are live)
+    await restore_active_streams()
 
     if RECORD_URL:
         log.info(f"📡 Recording platform push enabled → {RECORD_URL}")
