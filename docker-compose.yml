@@ -30,6 +30,8 @@ services:
       - S3_ACCESS_KEY=${S3_ACCESS_KEY:-}
       - S3_SECRET_KEY=${S3_SECRET_KEY:-}
       - DVR_PATH=/dvr
+      - RECORD_URL=${RECORD_URL:-}
+      - RECORD_API_KEY=${RECORD_API_KEY:-}
     volumes:
       - auth-db:/data
       - srs-dvr:/dvr
