@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -44,6 +45,10 @@ S3_ENDPOINT  = os.environ.get("S3_ENDPOINT", "")
 S3_BUCKET    = os.environ.get("S3_BUCKET", "streams")
 S3_ACCESS    = os.environ.get("S3_ACCESS_KEY", "")
 S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
+
+# Recordings platform — push stream events in real-time
+RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
+RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 
 MAX_PUBLISHERS = 100
 TOKEN_TTL      = 3600  # seconds — how long a viewer token is valid to start playing
@@ -92,10 +97,48 @@ def seed_test_data(db: Session):
     log.info("Test publishers seeded (stream-key-001, stream-key-002, stream-key-003)")
 
 # ── In-memory state ───────────────────────────────────────────────────────────
-# Production: move these to Redis
 
-active_streams: dict[str, dict] = {}   # stream_key -> {started_at, client_id, app}
-viewer_tokens:  dict[str, dict] = {}   # token -> {stream_key, used, expires_at}
+active_streams: dict[str, dict] = {}   # stream_key → {started_at, client_id, app, username}
+viewer_tokens:  dict[str, dict] = {}   # token → {stream_key, viewer_id, used, expires_at}
+active_viewers: dict[str, dict] = {}   # client_id → {stream_key, viewer_id, token, joined_at, ip_address}
+
+# ── Recordings Platform Push ──────────────────────────────────────────────────
+
+async def push_event(path: str, payload: dict, retries: int = 3) -> None:
+    """
+    Fire-and-forget POST to the recordings platform.
+    Retries up to `retries` times with exponential backoff.
+    Never raises — failures are logged but don't block SRS callbacks.
+    """
+    if not RECORD_URL or not RECORD_API_KEY:
+        return
+
+    url = f"{RECORD_URL}{path}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": RECORD_API_KEY,
+    }
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.is_success:
+                    log.info(f"✅ push_event {path} → {resp.status_code}")
+                    return
+                log.warning(f"⚠️  push_event {path} attempt {attempt}: HTTP {resp.status_code} — {resp.text[:200]}")
+        except Exception as e:
+            log.warning(f"⚠️  push_event {path} attempt {attempt}: {e}")
+
+        if attempt < retries:
+            await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
+
+    log.error(f"❌ push_event {path} failed after {retries} attempts")
+
+
+def fire(path: str, payload: dict) -> None:
+    """Schedule push_event as a background task (non-blocking)."""
+    asyncio.create_task(push_event(path, payload))
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -107,6 +150,11 @@ async def lifespan(app: FastAPI):
         seed_test_data(db)
     finally:
         db.close()
+
+    if RECORD_URL:
+        log.info(f"📡 Recording platform push enabled → {RECORD_URL}")
+    else:
+        log.warning("⚠️  RECORD_URL not set — stream events will NOT be pushed to recording platform")
 
     # Background: clean up expired tokens every 5 minutes
     async def cleanup_tokens():
@@ -171,9 +219,17 @@ async def on_publish(request: Request):
             "username":   publisher.username,
         }
         log.info(f"Stream started: {stream_key} by {publisher.username} ({len(active_streams)} active)")
+
+        # Push stream.started to recordings platform (non-blocking)
+        fire("/stream-analytics/sessions/start", {
+            "stream_key":    stream_key,
+            "srs_client_id": client_id,
+        })
+
         return srs_ok()
     finally:
         db.close()
+
 
 @app.post("/on_unpublish")
 async def on_unpublish(request: Request):
@@ -181,19 +237,41 @@ async def on_unpublish(request: Request):
     body = await request.json()
     stream_key = body.get("stream", "")
     log.info(f"on_unpublish: stream={stream_key}")
-    active_streams.pop(stream_key, None)
+
+    stream_info = active_streams.pop(stream_key, {})
+    started_at  = stream_info.get("started_at", time.time())
+    duration_s  = int(time.time() - started_at)
+
+    # Count viewers that were in this stream (still open = disconnected abruptly)
+    # Close any still-open viewer sessions in memory
+    abrupt_exits = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
+    for cid in abrupt_exits:
+        active_viewers.pop(cid, None)
+
+    # Push stream.ended to recordings platform
+    fire("/stream-analytics/sessions/end", {
+        "stream_key":      stream_key,
+        "total_views":     0,   # Redis will provide the real count in Work 2 Redis phase
+        "unique_viewers":  0,
+        "total_watch_seconds": 0,
+        "peak_concurrent": 0,
+    })
+
+    log.info(f"Stream ended: {stream_key} duration={duration_s}s")
     return srs_ok()
+
 
 @app.post("/on_play")
 async def on_play(request: Request):
     """
-    SRS fires this when a viewer starts playing (HTTP-FLV or HLS).
+    SRS fires this when a viewer starts playing (WebRTC).
     Validate the one-time token passed as ?token=xxx in the stream URL.
     """
-    body  = await request.json()
+    body      = await request.json()
     stream_key = body.get("stream", "")
     param      = body.get("param", "")   # e.g. "?token=abc123"
     client_id  = body.get("client_id", "")
+    ip_address = body.get("ip", "")
 
     log.info(f"on_play: stream={stream_key} param={param} client={client_id}")
 
@@ -215,17 +293,59 @@ async def on_play(request: Request):
     if entry["stream_key"] and entry["stream_key"] != stream_key:
         return srs_deny(f"Token not valid for stream {stream_key}")
 
-    # Token is time-limited (not one-time) — allows WebRTC ICE restarts
-    # and reconnects within the token TTL without requiring a new token.
-    log.info(f"Viewer authenticated: stream={stream_key} client={client_id}")
+    # Resolve viewer_id — use platform-provided ID or fall back to anonymous UUID
+    viewer_id   = entry.get("viewer_id") or f"anon-{client_id}"
+    is_anonymous = not bool(entry.get("viewer_id"))
+
+    # Track in memory for watch_seconds calculation on on_stop
+    active_viewers[client_id] = {
+        "stream_key":  stream_key,
+        "viewer_id":   viewer_id,
+        "token":       token,
+        "joined_at":   time.time(),
+        "ip_address":  ip_address,
+    }
+
+    log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id}")
+
+    # Push viewer.joined to recordings platform (non-blocking)
+    fire("/stream-analytics/viewers/join", {
+        "stream_key":  stream_key,
+        "viewer_id":   viewer_id,
+        "is_anonymous": is_anonymous,
+        "token":       token,
+        "ip_address":  ip_address or None,
+        "user_agent":  None,  # not available from SRS callbacks
+    })
+
     return srs_ok()
+
 
 @app.post("/on_stop")
 async def on_stop(request: Request):
-    """Viewer disconnected — no action needed."""
-    body = await request.json()
-    log.info(f"on_stop: stream={body.get('stream')} client={body.get('client_id')}")
+    """Viewer disconnected — record watch time."""
+    body      = await request.json()
+    stream_key = body.get("stream", "")
+    client_id  = body.get("client_id", "")
+
+    log.info(f"on_stop: stream={stream_key} client={client_id}")
+
+    viewer = active_viewers.pop(client_id, None)
+    if viewer:
+        watch_seconds = int(time.time() - viewer["joined_at"])
+        viewer_id     = viewer["viewer_id"]
+
+        log.info(f"Viewer left: stream={stream_key} viewer={viewer_id} watched={watch_seconds}s")
+
+        # Push viewer.left to recordings platform (non-blocking)
+        fire("/stream-analytics/viewers/leave", {
+            "stream_key":   stream_key,
+            "viewer_id":    viewer_id,
+            "watch_seconds": watch_seconds,
+        })
+
     return srs_ok()
+
 
 @app.post("/on_dvr")
 async def on_dvr(request: Request):
@@ -347,18 +467,24 @@ def list_publishers():
         db.close()
 
 @app.get("/token")
-def generate_token(stream_key: str):
-    """Generate a one-time viewer token for a stream."""
+def generate_token(stream_key: str, viewer_id: Optional[str] = None):
+    """
+    Generate a viewer token for a stream.
+    Pass viewer_id if the viewer is a known platform user — used for unique viewer deduplication.
+    If viewer_id is omitted the viewer is treated as anonymous.
+    """
     token = secrets.token_urlsafe(32)
     viewer_tokens[token] = {
         "stream_key": stream_key,
+        "viewer_id":  viewer_id,    # None = anonymous
         "expires_at": time.time() + TOKEN_TTL,
         "created_at": time.time(),
     }
-    log.info(f"Token generated for stream={stream_key}")
+    log.info(f"Token generated for stream={stream_key} viewer_id={viewer_id or 'anonymous'}")
     return {
         "token":      token,
         "stream_key": stream_key,
+        "viewer_id":  viewer_id,
         "expires_in": TOKEN_TTL,
         "player_url": f"/player?stream={stream_key}&token={token}",
     }
@@ -379,4 +505,9 @@ def list_streams():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "active_streams": len(active_streams)}
+    return {
+        "status":         "ok",
+        "active_streams": len(active_streams),
+        "active_viewers": len(active_viewers),
+        "record_url":     RECORD_URL or "not configured",
+    }
