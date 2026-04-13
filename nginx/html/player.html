@@ -65,8 +65,14 @@
   var MAX_RETRY   = 30;
   var connected   = false;
 
-  // Click overlay → unmute and hide it
+  // Click overlay → resume audio context first, then unmute
+  // Without resuming AudioContext, unmuting causes a ~0.5s dropout
   overlay.addEventListener('click', function () {
+    var ctx = window.AudioContext || window.webkitAudioContext;
+    if (ctx) {
+      var ac = new ctx();
+      ac.resume().then(function () { ac.close(); });
+    }
     video.muted = false;
     overlay.classList.add('hidden');
   });
