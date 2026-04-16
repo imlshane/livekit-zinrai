@@ -50,6 +50,7 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
+REDIS_URL      = os.environ.get("REDIS_URL", "")
 
 MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
@@ -104,6 +105,102 @@ def seed_test_data(db: Session):
 active_streams: dict[str, dict] = {}   # stream_key → {started_at, client_id, app, username}
 viewer_tokens:  dict[str, dict] = {}   # token → {stream_key, viewer_id, used, expires_at}
 active_viewers: dict[str, dict] = {}   # client_id → {stream_key, viewer_id, token, joined_at, ip_address}
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+
+redis_client = None   # set in lifespan if REDIS_URL is configured
+
+
+async def init_redis() -> None:
+    global redis_client
+    if not REDIS_URL:
+        log.warning("REDIS_URL not set — stream analytics will not be tracked in Redis")
+        return
+    try:
+        import redis.asyncio as aioredis
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        log.info(f"Redis connected: {REDIS_URL}")
+    except Exception as e:
+        log.error(f"Redis connection failed: {e} — continuing without Redis")
+        redis_client = None
+
+
+async def close_redis() -> None:
+    global redis_client
+    if redis_client:
+        await redis_client.aclose()
+        redis_client = None
+
+
+async def r_stream_start(stream_key: str, client_id: str, username: str) -> None:
+    if not redis_client:
+        return
+    try:
+        now = time.time()
+        pipe = redis_client.pipeline()
+        pipe.set(f"stream:{stream_key}:status",     "live")
+        pipe.set(f"stream:{stream_key}:started_at", now)
+        pipe.set(f"stream:{stream_key}:client_id",  client_id)
+        pipe.set(f"stream:{stream_key}:username",   username)
+        pipe.set(f"stream:{stream_key}:views",      0)
+        pipe.set(f"stream:{stream_key}:watch_seconds", 0)
+        pipe.delete(f"stream:{stream_key}:unique_viewers")
+        pipe.delete(f"stream:{stream_key}:sessions")
+        await pipe.execute()
+    except Exception as e:
+        log.warning(f"Redis r_stream_start failed: {e}")
+
+
+async def r_stream_end(stream_key: str) -> dict:
+    """Reads final analytics, marks status=ended. Returns stats dict."""
+    if not redis_client:
+        return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
+    try:
+        pipe = redis_client.pipeline()
+        pipe.get(f"stream:{stream_key}:started_at")
+        pipe.get(f"stream:{stream_key}:views")
+        pipe.get(f"stream:{stream_key}:watch_seconds")
+        pipe.pfcount(f"stream:{stream_key}:unique_viewers")
+        results = await pipe.execute()
+
+        await redis_client.set(f"stream:{stream_key}:status", "ended")
+
+        return {
+            "started_at":          float(results[0] or time.time()),
+            "total_views":         int(results[1] or 0),
+            "total_watch_seconds": int(results[2] or 0),
+            "unique_viewers":      int(results[3] or 0),
+        }
+    except Exception as e:
+        log.warning(f"Redis r_stream_end failed: {e}")
+        return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
+
+
+async def r_viewer_join(stream_key: str, viewer_id: str, client_id: str) -> None:
+    if not redis_client:
+        return
+    try:
+        pipe = redis_client.pipeline()
+        pipe.incr(f"stream:{stream_key}:views")
+        pipe.pfadd(f"stream:{stream_key}:unique_viewers", viewer_id)
+        pipe.hset(f"stream:{stream_key}:sessions", client_id, time.time())
+        await pipe.execute()
+    except Exception as e:
+        log.warning(f"Redis r_viewer_join failed: {e}")
+
+
+async def r_viewer_leave(stream_key: str, client_id: str, watch_seconds: int) -> None:
+    if not redis_client:
+        return
+    try:
+        pipe = redis_client.pipeline()
+        pipe.incrby(f"stream:{stream_key}:watch_seconds", watch_seconds)
+        pipe.hdel(f"stream:{stream_key}:sessions", client_id)
+        await pipe.execute()
+    except Exception as e:
+        log.warning(f"Redis r_viewer_leave failed: {e}")
+
 
 # ── Recordings Platform Push ──────────────────────────────────────────────────
 
@@ -207,6 +304,8 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    await init_redis()
+
     # Restore active_streams from SRS API (handles auth restarts while streams are live)
     await restore_active_streams()
 
@@ -238,6 +337,7 @@ async def lifespan(app: FastAPI):
 
     for t in tasks:
         t.cancel()
+    await close_redis()
 
 app = FastAPI(title="SRS Auth Service", lifespan=lifespan)
 
@@ -399,6 +499,8 @@ async def on_publish(request: Request):
         }
         log.info(f"Stream started: {stream_key} by {publisher.username} ({len(active_streams)} active)")
 
+        asyncio.create_task(r_stream_start(stream_key, client_id, publisher.username))
+
         # Push stream.started to recordings platform (non-blocking)
         fire("/stream-analytics/sessions/start", {
             "stream_key":    stream_key,
@@ -418,25 +520,26 @@ async def on_unpublish(request: Request):
     log.info(f"on_unpublish: stream={stream_key}")
 
     stream_info = active_streams.pop(stream_key, {})
-    started_at  = stream_info.get("started_at", time.time())
-    duration_s  = int(time.time() - started_at)
 
-    # Count viewers that were in this stream (still open = disconnected abruptly)
-    # Close any still-open viewer sessions in memory
+    # Close any still-open viewer sessions in memory (abrupt exits)
     abrupt_exits = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
     for cid in abrupt_exits:
         active_viewers.pop(cid, None)
 
-    # Push stream.ended to recordings platform
+    # Get real analytics from Redis, then push stream.ended
+    stats      = await r_stream_end(stream_key)
+    started_at = stats["started_at"]
+    duration_s = int(time.time() - started_at)
+
     fire("/stream-analytics/sessions/end", {
-        "stream_key":      stream_key,
-        "total_views":     0,   # Redis will provide the real count in Work 2 Redis phase
-        "unique_viewers":  0,
-        "total_watch_seconds": 0,
-        "peak_concurrent": 0,
+        "stream_key":          stream_key,
+        "total_views":         stats["total_views"],
+        "unique_viewers":      stats["unique_viewers"],
+        "total_watch_seconds": stats["total_watch_seconds"],
+        "peak_concurrent":     0,
     })
 
-    log.info(f"Stream ended: {stream_key} duration={duration_s}s")
+    log.info(f"Stream ended: {stream_key} duration={duration_s}s views={stats['total_views']} unique={stats['unique_viewers']}")
     return srs_ok()
 
 
@@ -487,6 +590,8 @@ async def on_play(request: Request):
 
     log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id}")
 
+    asyncio.create_task(r_viewer_join(stream_key, viewer_id, client_id))
+
     # Push viewer.joined to recordings platform (non-blocking)
     fire("/stream-analytics/viewers/join", {
         "stream_key":  stream_key,
@@ -515,6 +620,8 @@ async def on_stop(request: Request):
         viewer_id     = viewer["viewer_id"]
 
         log.info(f"Viewer left: stream={stream_key} viewer={viewer_id} watched={watch_seconds}s")
+
+        asyncio.create_task(r_viewer_leave(stream_key, client_id, watch_seconds))
 
         # Push viewer.left to recordings platform (non-blocking)
         fire("/stream-analytics/viewers/leave", {
@@ -682,6 +789,39 @@ def list_streams():
         for k, v in active_streams.items()
     ]
 
+@app.get("/stats/{stream_key}")
+async def stream_stats(stream_key: str):
+    """Live analytics for a stream from Redis."""
+    if not redis_client:
+        raise HTTPException(503, "Redis not configured")
+    try:
+        pipe = redis_client.pipeline()
+        pipe.get(f"stream:{stream_key}:status")
+        pipe.get(f"stream:{stream_key}:started_at")
+        pipe.get(f"stream:{stream_key}:views")
+        pipe.get(f"stream:{stream_key}:watch_seconds")
+        pipe.pfcount(f"stream:{stream_key}:unique_viewers")
+        pipe.hlen(f"stream:{stream_key}:sessions")
+        results = await pipe.execute()
+
+        if not results[0]:
+            raise HTTPException(404, f"No data for stream {stream_key}")
+
+        return {
+            "stream_key":          stream_key,
+            "status":              results[0],
+            "started_at":          float(results[1] or 0),
+            "total_views":         int(results[2] or 0),
+            "total_watch_seconds": int(results[3] or 0),
+            "unique_viewers":      int(results[4] or 0),
+            "concurrent_viewers":  int(results[5] or 0),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/health")
 def health():
     return {
@@ -689,4 +829,5 @@ def health():
         "active_streams": len(active_streams),
         "active_viewers": len(active_viewers),
         "record_url":     RECORD_URL or "not configured",
+        "redis":          "connected" if redis_client else "not configured",
     }

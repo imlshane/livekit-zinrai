@@ -1,5 +1,16 @@
 services:
 
+  redis:
+    image: redis:7-alpine
+    container_name: srs-redis
+    restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.20.0.3
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+
   srs:
     image: ossrs/srs:5
     container_name: srs-origin
@@ -32,6 +43,9 @@ services:
       - DVR_PATH=/dvr
       - RECORD_URL=${RECORD_URL:-}
       - RECORD_API_KEY=${RECORD_API_KEY:-}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+    depends_on:
+      - redis
     volumes:
       - auth-db:/data
       - srs-dvr:/dvr
@@ -54,6 +68,7 @@ services:
 volumes:
   srs-dvr:
   auth-db:
+  redis-data:
 
 networks:
   default:
