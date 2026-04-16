@@ -261,7 +261,7 @@ async def restore_active_streams() -> None:
     Prevents zero-state after an auth service restart while streams are running.
     """
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
             resp = await client.get(f"{SRS_API_URL}/api/v1/clients/")
             if not resp.is_success:
                 log.warning(f"⚠️  Could not query SRS API for state recovery: HTTP {resp.status_code}")
@@ -439,8 +439,8 @@ async def ghost_stream_reconciler() -> None:
     while True:
         await asyncio.sleep(30)
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{SRS_API_URL}/api/v1/streams")
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+                resp = await client.get(f"{SRS_API_URL}/api/v1/streams/")
 
             if not resp.is_success:
                 continue
