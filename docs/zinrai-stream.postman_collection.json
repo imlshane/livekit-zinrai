@@ -1,0 +1,210 @@
+{
+  "info": {
+    "name": "Zinrai Stream — SRS Auth API",
+    "description": "All endpoints for the Zinrai live streaming platform.\n\nSet these collection variables before use:\n- `base_url` — e.g. https://livestream.zinrai.live/api\n- `api_key`  — value of MANAGEMENT_API_KEY from server .env\n- `stream_key` — e.g. stream-key-001",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",   "value": "https://livestream.zinrai.live/api" },
+    { "key": "api_key",    "value": "61f0212d6928e5cdd959c1faf6f5409e4f4802dd21bbf4dfe06fbbc9e201dab5" },
+    { "key": "stream_key", "value": "stream-key-001" },
+    { "key": "viewer_token", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "No auth required. Returns service status, active stream/viewer counts, Redis connection state."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Publishers",
+      "item": [
+        {
+          "name": "List publishers",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "x-api-key", "value": "{{api_key}}" }],
+            "url": "{{base_url}}/publishers",
+            "description": "Returns all publishers with live status."
+          }
+        },
+        {
+          "name": "Create publisher",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "x-api-key",     "value": "{{api_key}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/publishers",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"new-publisher\",\n  \"stream_key\": \"my-custom-key\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Creates a publisher. stream_key is optional — auto-generated if omitted."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Tokens",
+      "item": [
+        {
+          "name": "Generate viewer token (anonymous)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "x-api-key", "value": "{{api_key}}" }],
+            "url": {
+              "raw": "{{base_url}}/token?stream_key={{stream_key}}",
+              "query": [{ "key": "stream_key", "value": "{{stream_key}}" }]
+            },
+            "description": "Generates a 1-hour viewer token. No viewer_id = anonymous viewer."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json.token) { pm.collectionVariables.set('viewer_token', json.token); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Generate viewer token (identified)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "x-api-key", "value": "{{api_key}}" }],
+            "url": {
+              "raw": "{{base_url}}/token?stream_key={{stream_key}}&viewer_id=user-123",
+              "query": [
+                { "key": "stream_key", "value": "{{stream_key}}" },
+                { "key": "viewer_id",  "value": "user-123" }
+              ]
+            },
+            "description": "Generates a token tied to a known viewer_id for unique viewer deduplication."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json.token) { pm.collectionVariables.set('viewer_token', json.token); }"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Streams",
+      "item": [
+        {
+          "name": "List live streams",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "x-api-key", "value": "{{api_key}}" }],
+            "url": "{{base_url}}/streams",
+            "description": "Returns all currently live streams with username and duration."
+          }
+        },
+        {
+          "name": "Stream analytics (Redis stats)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "x-api-key", "value": "{{api_key}}" }],
+            "url": "{{base_url}}/stats/{{stream_key}}",
+            "description": "Returns live Redis counters: status, total_views, unique_viewers (HyperLogLog), concurrent_viewers, total_watch_seconds."
+          }
+        }
+      ]
+    },
+    {
+      "name": "SRS Callbacks (internal)",
+      "description": "Called by SRS server automatically. No API key. Exposed only on Docker internal network — not accessible via nginx/public.",
+      "item": [
+        {
+          "name": "on_publish (OBS connects)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/on_publish",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stream\": \"{{stream_key}}\",\n  \"client_id\": \"client-abc123\",\n  \"app\": \"live\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Validates stream key. Returns code:0 to allow, code:403 to deny."
+          }
+        },
+        {
+          "name": "on_unpublish (OBS disconnects)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/on_unpublish",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stream\": \"{{stream_key}}\",\n  \"client_id\": \"client-abc123\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "on_play (viewer connects)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/on_play",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stream\": \"{{stream_key}}\",\n  \"client_id\": \"viewer-client-1\",\n  \"param\": \"?token={{viewer_token}}\",\n  \"ip\": \"1.2.3.4\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Validates viewer token. Run 'Generate viewer token' first to populate {{viewer_token}}."
+          }
+        },
+        {
+          "name": "on_stop (viewer disconnects)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/on_stop",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stream\": \"{{stream_key}}\",\n  \"client_id\": \"viewer-client-1\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "on_dvr (recording file ready)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/on_dvr",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stream\": \"{{stream_key}}\",\n  \"file\": \"/dvr/stream-key-001.flv\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Triggers ffmpeg conversion to MP4 + optional S3 upload."
+          }
+        }
+      ]
+    }
+  ]
+}
