@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event
@@ -50,7 +51,8 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
-REDIS_URL      = os.environ.get("REDIS_URL", "")
+REDIS_URL          = os.environ.get("REDIS_URL", "")
+MANAGEMENT_API_KEY = os.environ.get("MANAGEMENT_API_KEY", "")
 
 MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
@@ -59,6 +61,18 @@ TOKEN_TTL               = 3600   # seconds — how long a viewer token is valid 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+# ── API Key Auth ───────────────────────────────────────────────────────────────
+
+_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+async def require_api_key(key: str = Depends(_api_key_header)) -> None:
+    """Dependency applied to all management endpoints."""
+    if not MANAGEMENT_API_KEY:
+        # Key not configured — warn once on startup, allow through in dev
+        return
+    if key != MANAGEMENT_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -308,6 +322,11 @@ async def lifespan(app: FastAPI):
 
     # Restore active_streams from SRS API (handles auth restarts while streams are live)
     await restore_active_streams()
+
+    if MANAGEMENT_API_KEY:
+        log.info("Management API key configured — endpoints are protected")
+    else:
+        log.warning("MANAGEMENT_API_KEY not set — management endpoints are unprotected")
 
     if RECORD_URL:
         log.info(f"📡 Recording platform push enabled → {RECORD_URL}")
@@ -714,7 +733,7 @@ class PublisherCreate(BaseModel):
     stream_key: Optional[str] = None
 
 @app.post("/publishers")
-def create_publisher(body: PublisherCreate):
+def create_publisher(body: PublisherCreate, _: None = Depends(require_api_key)):
     db = get_db()
     try:
         count = db.query(Publisher).count()
@@ -735,7 +754,7 @@ def create_publisher(body: PublisherCreate):
         db.close()
 
 @app.get("/publishers")
-def list_publishers():
+def list_publishers(_: None = Depends(require_api_key)):
     db = get_db()
     try:
         pubs = db.query(Publisher).all()
@@ -753,7 +772,7 @@ def list_publishers():
         db.close()
 
 @app.get("/token")
-def generate_token(stream_key: str, viewer_id: Optional[str] = None):
+def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = Depends(require_api_key)):
     """
     Generate a viewer token for a stream.
     Pass viewer_id if the viewer is a known platform user — used for unique viewer deduplication.
@@ -776,7 +795,7 @@ def generate_token(stream_key: str, viewer_id: Optional[str] = None):
     }
 
 @app.get("/streams")
-def list_streams():
+def list_streams(_: None = Depends(require_api_key)):
     """Currently live streams with stats."""
     now = time.time()
     return [
@@ -790,7 +809,7 @@ def list_streams():
     ]
 
 @app.get("/stats/{stream_key}")
-async def stream_stats(stream_key: str):
+async def stream_stats(stream_key: str, _: None = Depends(require_api_key)):
     """Live analytics for a stream from Redis."""
     if not redis_client:
         raise HTTPException(503, "Redis not configured")

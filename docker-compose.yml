@@ -44,6 +44,7 @@ services:
       - RECORD_URL=${RECORD_URL:-}
       - RECORD_API_KEY=${RECORD_API_KEY:-}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - MANAGEMENT_API_KEY=${MANAGEMENT_API_KEY:-}
     depends_on:
       - redis
     volumes:
