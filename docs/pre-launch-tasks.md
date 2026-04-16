@@ -1,6 +1,6 @@
 # Pre-Launch Tasks
 
-Two items to complete before going live.
+Three items to complete before going live.
 
 ---
 
@@ -402,4 +402,100 @@ are started and cancelled together.
 
 ---
 
-*Created: 2026-04-13*
+## Task 3 — Disable HLS and HTTP-FLV (WebRTC Only)
+
+### Why
+
+Two protocols are currently enabled in `srs/origin.conf` alongside WebRTC:
+
+- **HLS** — writes `.ts` segment files to disk every 2 seconds per active stream,
+  regardless of whether any viewer is using HLS. For 6 streams that is constant
+  disk I/O running 24/7. Adds no value if all viewers use WebRTC.
+
+- **HTTP-FLV** — near-zero overhead but is dead code. Nothing in the player
+  uses it. Keeping it on is just noise.
+
+Disabling both keeps SRS focused on one job: RTMP ingest → WebRTC delivery.
+
+### Change 1 — Disable in `srs/origin.conf`
+
+```nginx
+# HTTP-FLV — disabled, WebRTC is primary protocol
+http_remux {
+    enabled     off;
+}
+
+# HLS — disabled, WebRTC is primary protocol
+# Re-enable only if you later need a fallback for viewers where WebRTC fails
+hls {
+    enabled     off;
+}
+```
+
+Remove or comment out the existing `http_remux` and `hls` blocks entirely.
+
+### Change 2 — Remove HLS fallback from `nginx/html/player.html`
+
+The player has a `tryHlsFallback()` function added as a safety net.
+With HLS disabled in SRS, this function would fail silently.
+Remove it and update the max-retry end condition:
+
+```javascript
+// Remove the tryHlsFallback() function entirely.
+
+// Update the end-of-retry condition:
+if (retryCount >= MAX_RETRY) {
+  setStatus('Stream unavailable. Refresh the page to try again.');
+  return;
+}
+```
+
+Also remove the HLS.js script tag from `<head>` if you added it:
+
+```html
+<!-- Remove this line if present -->
+<!-- <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script> -->
+```
+
+### Change 3 — Remove HLS location from `nginx/nginx.conf`
+
+```nginx
+# Remove this block entirely:
+# location ~ ^/hls/ {
+#     set $srs_backend http://srs:8080;
+#     proxy_pass       $srs_backend;
+#     ...
+# }
+```
+
+### Apply
+
+```bash
+docker compose restart srs
+docker compose exec nginx nginx -s reload
+```
+
+### Verify
+
+```bash
+# HLS endpoint should now return 404
+curl -I https://yourdomain.com/hls/live/teststream.m3u8
+# Expected: 404
+
+# WebRTC signaling should still work
+curl -X POST https://yourdomain.com/rtc/v1/play/ \
+  -H "Content-Type: application/json" \
+  -d '{"sdp":"","streamurl":"webrtc://yourdomain.com/live/teststream"}'
+# Expected: {"code":0,"sdp":"..."}  or  {"code":404} if stream not live — both are fine
+```
+
+### Note — Re-enabling HLS later
+
+If you later find that a portion of viewers cannot connect via WebRTC even
+with TURN, re-enabling HLS is a one-line change in `srs/origin.conf`:
+set `enabled off` back to `enabled on`. The HLS path in Nginx and the
+player fallback can be restored from git history.
+
+---
+
+*Created: 2026-04-16*
