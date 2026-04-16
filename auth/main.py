@@ -51,8 +51,10 @@ RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https:
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
 
-MAX_PUBLISHERS = 100
-TOKEN_TTL      = 3600  # seconds — how long a viewer token is valid to start playing
+MAX_PUBLISHERS          = 6
+MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
+STREAM_WARN_BEFORE_SEC  = 600    # warn 10 minutes before hard stop
+TOKEN_TTL               = 3600   # seconds — how long a viewer token is valid to start playing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -224,9 +226,18 @@ async def lifespan(app: FastAPI):
             if expired:
                 log.info(f"Cleaned up {len(expired)} expired tokens")
 
-    task = asyncio.create_task(cleanup_tokens())
+    # Start all background tasks
+    tasks = [
+        asyncio.create_task(cleanup_tokens()),
+        asyncio.create_task(stream_watchdog()),
+        asyncio.create_task(ghost_stream_reconciler()),
+        asyncio.create_task(dvr_disk_guard()),
+    ]
+
     yield
-    task.cancel()
+
+    for t in tasks:
+        t.cancel()
 
 app = FastAPI(title="SRS Auth Service", lifespan=lifespan)
 
@@ -241,6 +252,117 @@ def srs_deny(reason: str):
     return JSONResponse({"code": 403, "data": reason}, status_code=200)
     # Note: SRS reads the `code` field, not HTTP status, for allow/deny.
     # Return HTTP 200 always; SRS checks response body code != 0 to deny.
+
+
+async def force_stop_stream(stream_key: str, reason: str = "timeout") -> None:
+    """
+    Kick the publisher via the SRS HTTP API.
+    SRS will fire on_unpublish automatically after the kick.
+    """
+    try:
+        info      = active_streams.get(stream_key, {})
+        client_id = info.get("client_id")
+
+        if not client_id:
+            log.warning(f"force_stop: no client_id for {stream_key} — removing from state only")
+            active_streams.pop(stream_key, None)
+            return
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.delete(f"{SRS_API_URL}/api/v1/clients/{client_id}")
+
+        if resp.is_success or resp.status_code == 404:
+            log.info(f"Force-stopped stream={stream_key} client={client_id} reason={reason}")
+        else:
+            log.warning(f"force_stop: SRS returned {resp.status_code} for client {client_id}")
+
+    except Exception as e:
+        log.error(f"force_stop failed for {stream_key}: {e}")
+        # Remove from state anyway so the slot is freed
+        active_streams.pop(stream_key, None)
+
+
+async def stream_watchdog() -> None:
+    """
+    Runs every 60 seconds.
+    - Warns at (MAX_STREAM_DURATION_SEC - STREAM_WARN_BEFORE_SEC)
+    - Hard-stops at MAX_STREAM_DURATION_SEC
+    """
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+
+        for stream_key, info in list(active_streams.items()):
+            elapsed_sec = now - info.get("started_at", now)
+            elapsed_min = int(elapsed_sec // 60)
+            warn_at     = MAX_STREAM_DURATION_SEC - STREAM_WARN_BEFORE_SEC
+
+            if elapsed_sec >= MAX_STREAM_DURATION_SEC:
+                log.warning(
+                    f"Hard timeout: stream={stream_key} elapsed={elapsed_min}min — force stopping"
+                )
+                await force_stop_stream(stream_key, reason="timeout")
+
+            elif elapsed_sec >= warn_at:
+                remaining = int((MAX_STREAM_DURATION_SEC - elapsed_sec) // 60)
+                log.warning(
+                    f"Timeout warning: stream={stream_key} elapsed={elapsed_min}min "
+                    f"— will force-stop in ~{remaining} min"
+                )
+
+
+async def ghost_stream_reconciler() -> None:
+    """
+    Runs every 30 seconds.
+    Compares auth in-memory state vs SRS live streams.
+    Removes orphaned entries (OBS dropped without triggering on_unpublish).
+    """
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{SRS_API_URL}/api/v1/streams")
+
+            if not resp.is_success:
+                continue
+
+            srs_live    = {s["name"] for s in resp.json().get("streams", [])}
+            auth_active = set(active_streams.keys())
+            ghosts      = auth_active - srs_live
+
+            for ghost in ghosts:
+                log.warning(f"Ghost stream removed: {ghost} (in auth state but not in SRS)")
+                active_streams.pop(ghost, None)
+
+        except Exception as e:
+            log.warning(f"Reconciler error (non-fatal): {e}")
+
+
+async def dvr_disk_guard() -> None:
+    """
+    Runs every 5 minutes.
+    Logs a warning when DVR disk usage exceeds 70% and an error above 85%.
+    """
+    import shutil
+    while True:
+        await asyncio.sleep(300)
+        try:
+            usage   = shutil.disk_usage(DVR_PATH)
+            pct     = usage.used / usage.total * 100
+            free_gb = usage.free / 1024 ** 3
+
+            if pct > 85:
+                log.error(
+                    f"DVR disk critical: {pct:.1f}% used, {free_gb:.1f} GB free — "
+                    f"clean up {DVR_PATH} immediately"
+                )
+            elif pct > 70:
+                log.warning(
+                    f"DVR disk warning: {pct:.1f}% used, {free_gb:.1f} GB free"
+                )
+        except Exception as e:
+            log.warning(f"Disk guard error: {e}")
+
 
 # ── SRS Callbacks ─────────────────────────────────────────────────────────────
 

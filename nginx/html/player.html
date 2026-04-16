@@ -116,8 +116,16 @@
     cleanup();
 
     pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      bundlePolicy: 'max-bundle',
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        {
+          urls:       ['turn:turn.zinrai.live:3478', 'turns:turn.zinrai.live:5349'],
+          username:   'streaming',
+          credential: 'jsiWjs2302scourt',
+        },
+      ],
+      bundlePolicy:       'max-bundle',
+      iceTransportPolicy: 'all',
     });
 
     pc.addTransceiver('video', { direction: 'recvonly' });
