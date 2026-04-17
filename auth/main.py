@@ -120,6 +120,11 @@ active_streams: dict[str, dict] = {}   # stream_key → {started_at, client_id, 
 viewer_tokens:  dict[str, dict] = {}   # token → {stream_key, viewer_id, used, expires_at}
 active_viewers: dict[str, dict] = {}   # client_id → {stream_key, viewer_id, token, joined_at, ip_address}
 
+# FIFO queue of final analytics per stream_key.
+# Keyed by stream_key, each entry is a list so rapid restarts (same key within seconds)
+# don't overwrite each other.  on_unpublish appends; on_dvr/convert_and_upload pops oldest.
+stream_final_stats: dict[str, list[dict]] = {}
+
 # ── Redis ─────────────────────────────────────────────────────────────────────
 
 redis_client = None   # set in lifespan if REDIS_URL is configured
@@ -483,13 +488,43 @@ async def dvr_disk_guard() -> None:
             log.warning(f"Disk guard error: {e}")
 
 
+# ── Educator stream-key validation ────────────────────────────────────────────
+
+async def lookup_educator_by_stream_key(stream_key: str) -> Optional[dict]:
+    """
+    GET {RECORD_URL}/educators/by-stream-key/{stream_key} using the configured API key.
+    Returns the educator dict on success, or None if not found / inactive / unreachable.
+    Falls back to None (caller should check local DB) when RECORD_URL is not set.
+    """
+    if not RECORD_URL or not RECORD_API_KEY:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{RECORD_URL}/educators/by-stream-key/{stream_key}",
+                headers={"accept": "application/json", "x-api-key": RECORD_API_KEY},
+            )
+        if resp.status_code == 200:
+            return resp.json()   # full educator object
+        if resp.status_code == 404:
+            log.warning(f"lookup_educator: stream_key '{stream_key}' not found in recordings platform")
+        else:
+            log.warning(f"lookup_educator: unexpected status {resp.status_code} for '{stream_key}'")
+    except Exception as e:
+        log.error(f"lookup_educator: request failed for '{stream_key}': {e}")
+
+    return None
+
+
 # ── SRS Callbacks ─────────────────────────────────────────────────────────────
 
 @app.post("/on_publish")
 async def on_publish(request: Request):
     """
     SRS fires this when OBS connects to push an RTMP stream.
-    Validate: stream key exists, publisher enabled, under max cap.
+    Validates the stream key against the recordings platform (educator must exist and be active).
+    Falls back to local Publisher DB when RECORD_URL is not configured.
     """
     body = await request.json()
     stream_key = body.get("stream", "")
@@ -498,37 +533,42 @@ async def on_publish(request: Request):
 
     log.info(f"on_publish: stream={stream_key} client={client_id}")
 
-    db = get_db()
-    try:
-        publisher = db.query(Publisher).filter_by(stream_key=stream_key, enabled=True).first()
-        if not publisher:
-            return srs_deny(f"Unknown or disabled stream key: {stream_key}")
+    # ── Validate stream key against recordings platform ──────────────────────
+    if not RECORD_URL or not RECORD_API_KEY:
+        return srs_deny("Recordings platform not configured — all streams are blocked")
 
-        if stream_key in active_streams:
-            return srs_deny(f"Stream key already in use: {stream_key}")
+    educator = await lookup_educator_by_stream_key(stream_key)
+    if not educator:
+        return srs_deny(f"Stream key not registered in recordings platform: {stream_key}")
+    if not educator.get("is_active", False):
+        return srs_deny(f"Educator is inactive, stream not allowed: {stream_key}")
 
-        if len(active_streams) >= MAX_PUBLISHERS:
-            return srs_deny(f"Max publisher limit ({MAX_PUBLISHERS}) reached")
+    username = educator.get("name", stream_key)
+    log.info(f"Educator validated: '{username}' (id={educator.get('id')})")
 
-        active_streams[stream_key] = {
-            "started_at": time.time(),
-            "client_id":  client_id,
-            "app":        app_name,
-            "username":   publisher.username,
-        }
-        log.info(f"Stream started: {stream_key} by {publisher.username} ({len(active_streams)} active)")
+    if stream_key in active_streams:
+        return srs_deny(f"Stream key already in use: {stream_key}")
 
-        asyncio.create_task(r_stream_start(stream_key, client_id, publisher.username))
+    if len(active_streams) >= MAX_PUBLISHERS:
+        return srs_deny(f"Max publisher limit ({MAX_PUBLISHERS}) reached")
 
-        # Push stream.started to recordings platform (non-blocking)
-        fire("/stream-analytics/sessions/start", {
-            "stream_key":    stream_key,
-            "srs_client_id": client_id,
-        })
+    active_streams[stream_key] = {
+        "started_at": time.time(),
+        "client_id":  client_id,
+        "app":        app_name,
+        "username":   username,
+    }
+    log.info(f"Stream started: {stream_key} by '{username}' ({len(active_streams)} active)")
 
-        return srs_ok()
-    finally:
-        db.close()
+    asyncio.create_task(r_stream_start(stream_key, client_id, username))
+
+    # Push stream.started to recordings platform (non-blocking)
+    fire("/stream-analytics/sessions/start", {
+        "stream_key":    stream_key,
+        "srs_client_id": client_id,
+    })
+
+    return srs_ok()
 
 
 @app.post("/on_unpublish")
@@ -549,6 +589,15 @@ async def on_unpublish(request: Request):
     stats      = await r_stream_end(stream_key)
     started_at = stats["started_at"]
     duration_s = int(time.time() - started_at)
+
+    # Stash analytics for this session so on_dvr can pass them to /stream/ingest.
+    # Use a FIFO list per stream_key so rapid back-to-back sessions don't clobber each other.
+    stream_final_stats.setdefault(stream_key, []).append({
+        "total_views":         stats["total_views"],
+        "unique_viewers":      stats["unique_viewers"],
+        "total_watch_seconds": stats["total_watch_seconds"],
+        "started_at":          started_at,
+    })
 
     fire("/stream-analytics/sessions/end", {
         "stream_key":          stream_key,
@@ -671,9 +720,7 @@ async def on_dvr(request: Request):
 # ── DVR Worker ────────────────────────────────────────────────────────────────
 
 async def convert_and_upload(flv_path: str, stream_key: str):
-    """Convert .flv to .mp4 via ffmpeg, then upload to S3-compatible storage."""
-    import subprocess
-
+    """Convert .flv to .mp4 via ffmpeg, upload to R2, then trigger VOD pipeline."""
     flv = Path(flv_path)
     if not flv.exists():
         log.error(f"DVR file not found: {flv_path}")
@@ -697,16 +744,36 @@ async def convert_and_upload(flv_path: str, stream_key: str):
             return
         log.info(f"Conversion done: {mp4} ({mp4.stat().st_size // 1024 // 1024} MB)")
     except FileNotFoundError:
-        log.warning("ffmpeg not installed — skipping conversion. Install ffmpeg in auth container for VOD.")
+        log.warning("ffmpeg not installed — skipping conversion. Install ffmpeg in auth container.")
         return
 
+    r2_key = None
     if S3_ENDPOINT and S3_ACCESS:
-        await upload_to_s3(mp4, stream_key)
+        r2_key = await upload_to_r2(mp4, stream_key)
     else:
         log.info("S3 not configured — mp4 saved locally at " + str(mp4))
 
-async def upload_to_s3(mp4: Path, stream_key: str):
-    """Upload mp4 to R2 / DO Spaces / any S3-compatible storage."""
+    # Pop the oldest queued analytics for this stream_key (FIFO).
+    # Each on_unpublish appends one entry; we consume here in the same order sessions ended.
+    queue = stream_final_stats.get(stream_key, [])
+    session_stats = queue.pop(0) if queue else {}
+    if not queue:
+        stream_final_stats.pop(stream_key, None)
+
+    if r2_key and RECORD_URL:
+        asyncio.create_task(push_event("/stream/ingest", {
+            "stream_key":          stream_key,
+            "r2_raw_path":         r2_key,
+            "total_views":         session_stats.get("total_views", 0),
+            "unique_viewers":      session_stats.get("unique_viewers", 0),
+            "total_watch_seconds": session_stats.get("total_watch_seconds", 0),
+            "started_at":          session_stats.get("started_at"),
+        }))
+    elif not RECORD_URL:
+        log.info(f"RECORD_URL not set — skipping ingest call for {stream_key}")
+
+async def upload_to_r2(mp4: Path, stream_key: str) -> Optional[str]:
+    """Upload mp4 to R2. Returns the R2 object key, or None on failure."""
     try:
         import boto3
         from botocore.config import Config
@@ -719,12 +786,14 @@ async def upload_to_s3(mp4: Path, stream_key: str):
             config=Config(signature_version="s3v4"),
         )
         key = f"recordings/{stream_key}/{mp4.name}"
-        log.info(f"Uploading {mp4.name} → s3://{S3_BUCKET}/{key}")
+        log.info(f"Uploading {mp4.name} → r2://{S3_BUCKET}/{key}")
         s3.upload_file(str(mp4), S3_BUCKET, key)
-        log.info(f"Upload complete: {key}")
+        log.info(f"R2 upload complete: {key}")
         mp4.unlink()   # delete local file after upload
+        return key
     except Exception as e:
-        log.error(f"S3 upload failed: {e}")
+        log.error(f"R2 upload failed: {e}")
+        return None
 
 # ── Management APIs ───────────────────────────────────────────────────────────
 
