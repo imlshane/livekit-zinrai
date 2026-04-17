@@ -57,7 +57,7 @@ MANAGEMENT_API_KEY = os.environ.get("MANAGEMENT_API_KEY", "")
 MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
 STREAM_WARN_BEFORE_SEC  = 600    # warn 10 minutes before hard stop
-TOKEN_TTL               = 3600   # seconds — how long a viewer token is valid to start playing
+TOKEN_TTL               = 7200   # seconds — matches 2h max stream duration
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -343,11 +343,15 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(300)
             now = time.time()
-            expired = [t for t, v in viewer_tokens.items() if v["expires_at"] < now]
-            for t in expired:
+            to_remove = [
+                t for t, v in viewer_tokens.items()
+                if v["expires_at"] < now                                      # naturally expired
+                or (v.get("used") and (now - (v.get("used_at") or 0)) > 10800)  # used + 3h retention
+            ]
+            for t in to_remove:
                 del viewer_tokens[t]
-            if expired:
-                log.info(f"Cleaned up {len(expired)} expired tokens")
+            if to_remove:
+                log.info(f"Cleaned up {len(to_remove)} tokens ({sum(1 for t in to_remove if viewer_tokens.get(t, {}).get('used'))} used, rest expired)")
 
     # Start all background tasks
     tasks = [
@@ -640,8 +644,16 @@ async def on_play(request: Request):
         viewer_tokens.pop(token, None)
         return srs_deny("Token expired")
 
+    # One-time enforcement — token is consumed on first use
+    if entry.get("used"):
+        return srs_deny("Token already used")
+
     if entry["stream_key"] and entry["stream_key"] != stream_key:
         return srs_deny(f"Token not valid for stream {stream_key}")
+
+    # Mark token as used — kept in dict for 3h for audit then GC removes it
+    entry["used"]    = True
+    entry["used_at"] = time.time()
 
     # Resolve viewer_id — use platform-provided ID or fall back to anonymous UUID
     viewer_id   = entry.get("viewer_id") or f"anon-{client_id}"
@@ -853,6 +865,8 @@ def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = D
         "viewer_id":  viewer_id,    # None = anonymous
         "expires_at": time.time() + TOKEN_TTL,
         "created_at": time.time(),
+        "used":       False,
+        "used_at":    None,
     }
     log.info(f"Token generated for stream={stream_key} viewer_id={viewer_id or 'anonymous'}")
     return {
