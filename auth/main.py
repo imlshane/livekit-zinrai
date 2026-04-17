@@ -629,14 +629,44 @@ async def on_play(request: Request):
 
     log.info(f"on_play: stream={stream_key} param={param} client={client_id}")
 
-    # Parse token from query string
+    # Parse token and browser session id from query string
     qs    = urllib.parse.parse_qs(param.lstrip("?"))
     token = qs.get("token", [None])[0]
+    sid   = qs.get("sid",   [None])[0]
 
-    # Token check temporarily bypassed — allow all plays for WebRTC connectivity test
-    entry        = {}
-    viewer_id    = f"anon-{client_id}"
-    is_anonymous = True
+    if not token:
+        return srs_deny("Missing viewer token")
+
+    entry = viewer_tokens.get(token)
+    if not entry:
+        return srs_deny("Invalid token")
+
+    if entry["expires_at"] < time.time():
+        viewer_tokens.pop(token, None)
+        return srs_deny("Token expired")
+
+    if entry["stream_key"] and entry["stream_key"] != stream_key:
+        return srs_deny(f"Token not valid for stream {stream_key}")
+
+    if entry.get("used"):
+        # Allow reconnects from the same browser tab (same IP + same session id)
+        bound_ip  = entry.get("bound_ip")
+        bound_sid = entry.get("bound_sid")
+        if ip_address != bound_ip:
+            log.warning(f"on_play DENIED: token reuse from different IP {ip_address} (bound to {bound_ip})")
+            return srs_deny("Token already claimed by another viewer")
+        if sid and bound_sid and sid != bound_sid:
+            log.warning(f"on_play DENIED: token reuse from different session {sid} (bound to {bound_sid})")
+            return srs_deny("Token already claimed by another session")
+    else:
+        # First use — bind token to this IP and browser session
+        entry["used"]      = True
+        entry["used_at"]   = time.time()
+        entry["bound_ip"]  = ip_address
+        entry["bound_sid"] = sid
+
+    viewer_id    = entry.get("viewer_id") or f"anon-{client_id}"
+    is_anonymous = not bool(entry.get("viewer_id"))
 
     # Track in memory for watch_seconds calculation on on_stop
     active_viewers[client_id] = {
@@ -647,7 +677,7 @@ async def on_play(request: Request):
         "ip_address":  ip_address,
     }
 
-    log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id}")
+    log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id} ip={ip_address}")
 
     asyncio.create_task(r_viewer_join(stream_key, viewer_id, client_id))
 

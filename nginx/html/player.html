@@ -40,6 +40,15 @@
   var params    = new URLSearchParams(window.location.search);
   var streamKey = params.get('stream');
   var token     = params.get('token');
+
+  // Stable per-tab session ID — persists across WebRTC reconnects within the same tab
+  // but is brand-new for every new tab, blocking URL sharing
+  var sid = sessionStorage.getItem('zs_sid');
+  if (!sid) {
+    sid = ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+      (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+    sessionStorage.setItem('zs_sid', sid);
+  }
   var statusEl  = document.getElementById('status');
   var errorEl   = document.getElementById('error');
   var video     = document.getElementById('video');
@@ -85,7 +94,10 @@
   function streamUrl() {
     // Token must be in streamurl — SRS uses this for on_play param, not the HTTP URL
     var url = 'webrtc://' + window.location.host + '/live/' + streamKey;
-    if (token) url += '?token=' + token;
+    var qs = [];
+    if (token) qs.push('token=' + token);
+    qs.push('sid=' + sid);
+    if (qs.length) url += '?' + qs.join('&');
     return url;
   }
 
