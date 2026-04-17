@@ -867,12 +867,19 @@ def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = D
 def list_streams(_: None = Depends(require_api_key)):
     """Currently live streams with stats."""
     now = time.time()
+    # Count concurrent viewers per stream from in-memory state
+    viewers_per_stream: dict[str, int] = {}
+    for v in active_viewers.values():
+        sk = v["stream_key"]
+        viewers_per_stream[sk] = viewers_per_stream.get(sk, 0) + 1
+
     return [
         {
-            "stream_key": k,
-            "username":   v["username"],
-            "duration_s": int(now - v["started_at"]),
-            "app":        v["app"],
+            "stream_key":         k,
+            "username":           v["username"],
+            "duration_s":         int(now - v["started_at"]),
+            "app":                v["app"],
+            "concurrent_viewers": viewers_per_stream.get(k, 0),
         }
         for k, v in active_streams.items()
     ]
