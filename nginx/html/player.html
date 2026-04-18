@@ -37,9 +37,8 @@
 
 <script>
 (function () {
-  var params    = new URLSearchParams(window.location.search);
-  var streamKey = params.get('stream');
-  var token     = params.get('token');
+  var params = new URLSearchParams(window.location.search);
+  var token  = params.get('token');
 
   // Stable per-tab session ID — persists across WebRTC reconnects within the same tab
   // but is brand-new for every new tab, blocking URL sharing
@@ -56,9 +55,9 @@
   function setStatus(msg) { statusEl.textContent = msg; }
   function setError(msg)  { errorEl.textContent = msg; errorEl.style.display = msg ? 'block' : 'none'; }
 
-  if (!streamKey) {
-    setStatus('No stream specified.');
-    setError('Add ?stream=YOUR_STREAM_KEY&token=YOUR_TOKEN to the URL.');
+  if (!token) {
+    setStatus('No token specified.');
+    setError('Add ?token=YOUR_TOKEN to the URL.');
     return;
   }
 
@@ -86,19 +85,9 @@
     overlay.classList.add('hidden');
   });
 
-  // SRS5 uses proprietary JSON API at /rtc/v1/play/ (not WHEP which is SRS6+)
-  function rtcPlayUrl() {
-    return '/rtc/v1/play/';
-  }
-
-  function streamUrl() {
-    // Token must be in streamurl — SRS uses this for on_play param, not the HTTP URL
-    var url = 'webrtc://' + window.location.host + '/live/' + streamKey;
-    var qs = [];
-    if (token) qs.push('token=' + token);
-    qs.push('sid=' + sid);
-    if (qs.length) url += '?' + qs.join('&');
-    return url;
+  // Proxy endpoint — stream_key never exposed to browser
+  function playApiUrl() {
+    return '/api/play';
   }
 
   function scheduleRetry(delaySec) {
@@ -183,29 +172,25 @@
       return;
     }
 
-    // POST SDP offer to SRS /rtc/v1/play/ (SRS5 proprietary JSON API)
+    // POST SDP offer to auth proxy — stream_key resolved server-side
     var result;
     try {
-      var resp = await fetch(rtcPlayUrl(), {
+      var resp = await fetch(playApiUrl(), {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ sdp: offer.sdp, streamurl: streamUrl() }),
+        body:    JSON.stringify({ sdp: offer.sdp, token: token, sid: sid }),
       });
+      if (resp.status === 401 || resp.status === 403) {
+        setStatus('Access denied.');
+        setError('Token invalid or expired. Get a new link from the host.');
+        return;  // do NOT retry on auth failure
+      }
+      if (resp.status === 404) {
+        scheduleRetry();
+        return;
+      }
       result = await resp.json();
     } catch (e) {
-      // Network error or stream not started yet
-      scheduleRetry();
-      return;
-    }
-
-    if (result.code === 401 || result.code === 403) {
-      setStatus('Access denied.');
-      setError('Token invalid or expired. Get a new link from the host.');
-      return;  // do NOT retry on auth failure
-    }
-
-    if (result.code !== 0) {
-      // Non-zero code = stream not ready yet (404) or other transient error
       scheduleRetry();
       return;
     }

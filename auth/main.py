@@ -1037,15 +1037,62 @@ async def get_stream_token(event_id: str, viewer_id: Optional[str] = None):
     }
     log.info(f"Token issued for event={event_id} stream={stream_key} viewer={viewer_id or 'anonymous'}")
 
-    srs_host = os.environ.get("SRS_PUBLIC_HOST", "")  # e.g. livestream.zinrai.live
     return {
         "token":      token,
-        "stream_key": stream_key,
         "expires_in": TOKEN_TTL,
-        "player_url": f"/player?stream={stream_key}&token={token}",
-        "hls_url":    f"https://{srs_host}/live/{stream_key}.m3u8?token={token}" if srs_host else None,
-        "webrtc_url": f"webrtc://{srs_host}/live/{stream_key}" if srs_host else None,
+        "player_url": f"/player?token={token}",
     }
+
+
+# ── WebRTC proxy — hides stream_key from browser ─────────────────────────────
+
+class PlayRequest(BaseModel):
+    sdp:   str
+    token: str
+    sid:   Optional[str] = None
+
+@app.post("/play")
+async def webrtc_play(body: PlayRequest, request: Request):
+    """
+    Public endpoint — no API key required.
+    Browser posts { sdp, token } — stream_key is never exposed to the client.
+    Resolves token → stream_key, forwards SDP offer to SRS, returns SDP answer.
+    """
+    entry = viewer_tokens.get(body.token)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    if entry["expires_at"] < time.time():
+        viewer_tokens.pop(body.token, None)
+        raise HTTPException(status_code=401, detail="Token expired.")
+
+    stream_key = entry["stream_key"]
+    sid = body.sid or secrets.token_hex(8)
+    client_ip = request.headers.get("x-real-ip") or request.client.host
+
+    srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
+    stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{SRS_API_URL}/rtc/v1/play/",
+                json={"sdp": body.sdp, "streamurl": stream_url},
+                headers={"Content-Type": "application/json"},
+            )
+        result = resp.json()
+    except Exception as e:
+        log.error(f"SRS /rtc/v1/play/ proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Stream server unreachable.")
+
+    if result.get("code") == 401 or result.get("code") == 403:
+        raise HTTPException(status_code=403, detail="Stream access denied.")
+
+    if result.get("code") != 0:
+        # Non-zero = stream not ready yet (treat as 404 so client retries)
+        raise HTTPException(status_code=404, detail="Stream not live yet.")
+
+    log.info(f"WebRTC play proxied: stream={stream_key} ip={client_ip} sid={sid}")
+    return {"sdp": result["sdp"]}
 
 
 # ── Management APIs ───────────────────────────────────────────────────────────
@@ -1112,10 +1159,8 @@ def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = D
     log.info(f"Token generated for stream={stream_key} viewer_id={viewer_id or 'anonymous'}")
     return {
         "token":      token,
-        "stream_key": stream_key,
-        "viewer_id":  viewer_id,
         "expires_in": TOKEN_TTL,
-        "player_url": f"/player?stream={stream_key}&token={token}",
+        "player_url": f"/player?token={token}",
     }
 
 @app.get("/streams")
