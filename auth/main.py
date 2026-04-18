@@ -1072,14 +1072,15 @@ async def webrtc_play(body: PlayRequest, request: Request):
     srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
     stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
 
+    log.info(f"WebRTC proxy: calling SRS {SRS_API_URL}/rtc/v1/play/ streamurl={stream_url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{SRS_API_URL}/rtc/v1/play/",
                 json={"sdp": body.sdp, "streamurl": stream_url},
-                headers={"Content-Type": "application/json"},
             )
         result = resp.json()
+        log.info(f"SRS /rtc/v1/play/ response: http={resp.status_code} code={result.get('code')} data={result.get('data', '')}")
     except Exception as e:
         log.error(f"SRS /rtc/v1/play/ proxy error: {e}")
         raise HTTPException(status_code=502, detail="Stream server unreachable.")
@@ -1088,7 +1089,6 @@ async def webrtc_play(body: PlayRequest, request: Request):
         raise HTTPException(status_code=403, detail="Stream access denied.")
 
     if result.get("code") != 0:
-        # Non-zero = stream not ready yet (treat as 404 so client retries)
         raise HTTPException(status_code=404, detail="Stream not live yet.")
 
     log.info(f"WebRTC play proxied: stream={stream_key} ip={client_ip} sid={sid}")
