@@ -23,7 +23,7 @@ services:
       - "8000:8000/udp"   # WebRTC media (SRTP)
     volumes:
       - ./srs/origin.conf:/usr/local/srs/conf/srs.conf
-      - srs-dvr:/dvr
+      - ./dvr:/dvr
     depends_on:
       - auth
 
@@ -50,7 +50,7 @@ services:
       - redis
     volumes:
       - auth-db:/data
-      - srs-dvr:/dvr
+      - ./dvr:/dvr
 
   nginx:
     image: nginx:alpine
@@ -68,7 +68,6 @@ services:
       - auth
 
 volumes:
-  srs-dvr:
   auth-db:
   redis-data:
 
