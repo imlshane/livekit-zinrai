@@ -52,8 +52,9 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
-REDIS_URL          = os.environ.get("REDIS_URL", "")
-MANAGEMENT_API_KEY = os.environ.get("MANAGEMENT_API_KEY", "")
+REDIS_URL           = os.environ.get("REDIS_URL", "")
+MANAGEMENT_API_KEY  = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
+VIEWER_TOKEN_API_KEY = os.environ.get("VIEWER_TOKEN_API_KEY", "")  # LMS / frontend token generation only
 
 MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
@@ -68,12 +69,19 @@ log = logging.getLogger(__name__)
 _api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 async def require_api_key(key: str = Depends(_api_key_header)) -> None:
-    """Dependency applied to all management endpoints."""
+    """Dependency for internal management endpoints (recording server, ops)."""
     if not MANAGEMENT_API_KEY:
-        # Key not configured — warn once on startup, allow through in dev
         return
     if key != MANAGEMENT_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+async def require_viewer_token_key(key: str = Depends(_api_key_header)) -> None:
+    """Dependency for /token endpoint — separate key for LMS/frontend, rotatable independently."""
+    active_key = VIEWER_TOKEN_API_KEY or MANAGEMENT_API_KEY  # fall back to management key if not set
+    if not active_key:
+        return
+    if key != active_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing viewer token API key")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -390,9 +398,14 @@ async def lifespan(app: FastAPI):
     await restore_active_streams()
 
     if MANAGEMENT_API_KEY:
-        log.info("Management API key configured — endpoints are protected")
+        log.info("Management API key configured — internal endpoints are protected")
     else:
         log.warning("MANAGEMENT_API_KEY not set — management endpoints are unprotected")
+
+    if VIEWER_TOKEN_API_KEY:
+        log.info("Viewer token API key configured — /token endpoint uses separate key")
+    else:
+        log.warning("VIEWER_TOKEN_API_KEY not set — /token falls back to MANAGEMENT_API_KEY")
 
     if RECORD_URL:
         log.info(f"📡 Recording platform push enabled → {RECORD_URL}")
@@ -1036,7 +1049,7 @@ def list_publishers(_: None = Depends(require_api_key)):
         db.close()
 
 @app.get("/token")
-def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = Depends(require_api_key)):
+def generate_token(stream_key: str, viewer_id: Optional[str] = None, _: None = Depends(require_viewer_token_key)):
     """
     Generate a viewer token for a stream.
     Pass viewer_id if the viewer is a known platform user — used for unique viewer deduplication.
