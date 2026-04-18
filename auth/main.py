@@ -32,7 +32,7 @@ from typing import Optional
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -259,6 +259,62 @@ async def push_event(path: str, payload: dict, retries: int = 3) -> None:
 def fire(path: str, payload: dict) -> None:
     """Schedule push_event as a background task (non-blocking)."""
     asyncio.create_task(push_event(path, payload))
+
+
+async def _register_video_task(stream_key: str, username: str, educator_id: Optional[str], app_name: str) -> None:
+    """Register a new Video record in the recordings platform and cache the video_id in Redis."""
+    if not RECORD_URL or not RECORD_API_KEY:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{RECORD_URL}/stream/register",
+                json={
+                    "stream_key":    stream_key,
+                    "educator_name": username,
+                    "educator_id":   educator_id,
+                    "app":           app_name,
+                    "started_at":    time.time(),
+                },
+                headers={"x-api-key": RECORD_API_KEY, "Content-Type": "application/json"},
+            )
+        if resp.is_success:
+            video_id = resp.json().get("video_id")
+            if video_id and redis_client:
+                await redis_client.set(f"stream:{stream_key}:video_id", video_id, ex=86400)
+                await redis_client.set(f"video:{video_id}:stream_key", stream_key, ex=86400)
+            log.info(f"Video registered: {video_id} for stream {stream_key}")
+        else:
+            log.warning(f"Video registration failed: HTTP {resp.status_code} — {resp.text[:200]}")
+    except Exception as e:
+        log.error(f"Video registration error for {stream_key}: {e}")
+
+
+def generate_vod_m3u8(stream_key: str, app: str = "live") -> Optional[Path]:
+    """Build a complete VOD m3u8 from all .ts files in the HLS dir and save it alongside them."""
+    hls_dir = Path(HLS_PATH) / app / stream_key
+    if not hls_dir.exists():
+        return None
+    ts_files = sorted(
+        hls_dir.glob(f"{stream_key}-*.ts"),
+        key=lambda f: int(f.stem.rsplit("-", 1)[1]),
+    )
+    if not ts_files:
+        return None
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        "#EXT-X-TARGETDURATION:2",
+    ]
+    for ts in ts_files:
+        lines.append("#EXTINF:2.000,")
+        lines.append(ts.name)
+    lines.append("#EXT-X-ENDLIST")
+    vod = hls_dir / f"{stream_key}-vod.m3u8"
+    vod.write_text("\n".join(lines) + "\n")
+    log.info(f"VOD m3u8 generated: {vod} ({len(ts_files)} segments)")
+    return vod
 
 
 async def restore_active_streams() -> None:
@@ -567,6 +623,10 @@ async def on_publish(request: Request):
 
     asyncio.create_task(r_stream_start(stream_key, client_id, username))
 
+    # Register a Video record in recordings platform — video_id cached in Redis for on_dvr
+    if RECORD_URL:
+        asyncio.create_task(_register_video_task(stream_key, username, educator.get("id"), app_name))
+
     # Push stream.started to recordings platform (non-blocking)
     fire("/stream-analytics/sessions/start", {
         "stream_key":    stream_key,
@@ -770,35 +830,37 @@ async def convert_and_upload(flv_path: str, stream_key: str):
         log.warning("ffmpeg not installed — skipping conversion. Install ffmpeg in auth container.")
         return
 
-    r2_key = None
-    r2_hls_key = None
-    if S3_ENDPOINT and S3_ACCESS:
-        r2_key     = await upload_to_r2(mp4, stream_key)
-        r2_hls_key = await upload_hls_to_r2(stream_key)
+    # Rename MP4 to {video_id}.mp4 so recordings worker can fetch it by video_id
+    video_id = None
+    if redis_client:
+        video_id = await redis_client.get(f"stream:{stream_key}:video_id")
+    if video_id:
+        named_mp4 = mp4.parent / f"{video_id}.mp4"
+        mp4.rename(named_mp4)
+        mp4 = named_mp4
+        log.info(f"Renamed to {mp4.name}")
     else:
-        log.info("S3 not configured — mp4 saved locally at " + str(mp4))
+        log.warning(f"No video_id in Redis for {stream_key} — file stays as {mp4.name}")
 
-    # Pop the oldest queued analytics for this stream_key (FIFO).
-    # Each on_unpublish appends one entry; we consume here in the same order sessions ended.
+    # Generate a complete VOD m3u8 from all HLS segments accumulated during the stream
+    generate_vod_m3u8(stream_key)
+
+    # Pop analytics (queued by on_unpublish)
     queue = stream_final_stats.get(stream_key, [])
     session_stats = queue.pop(0) if queue else {}
     if not queue:
         stream_final_stats.pop(stream_key, None)
 
-    if r2_key and RECORD_URL:
-        payload = {
-            "stream_key":          stream_key,
-            "r2_raw_path":         r2_key,
+    # Finalize the Video record — recordings worker will pick it up and upload
+    if video_id and RECORD_URL:
+        asyncio.create_task(push_event(f"/stream/finalize/{video_id}", {
             "total_views":         session_stats.get("total_views", 0),
             "unique_viewers":      session_stats.get("unique_viewers", 0),
             "total_watch_seconds": session_stats.get("total_watch_seconds", 0),
             "started_at":          session_stats.get("started_at"),
-        }
-        if r2_hls_key:
-            payload["r2_hls_live_path"] = r2_hls_key
-        asyncio.create_task(push_event("/stream/ingest", payload))
+        }))
     elif not RECORD_URL:
-        log.info(f"RECORD_URL not set — skipping ingest call for {stream_key}")
+        log.info(f"RECORD_URL not set — skipping finalize for {stream_key}")
 
 async def upload_hls_to_r2(stream_key: str, app: str = "live") -> Optional[str]:
     """Upload all HLS segments + m3u8 for a stream to R2. Returns the m3u8 key, or None on failure."""
@@ -859,6 +921,63 @@ async def upload_to_r2(mp4: Path, stream_key: str) -> Optional[str]:
     except Exception as e:
         log.error(f"R2 upload failed: {e}")
         return None
+
+# ── File serving for recordings worker ───────────────────────────────────────
+
+@app.get("/dvr-files/{video_id}")
+async def serve_dvr_file(video_id: str, request: Request):
+    """Serve the converted MP4 for a stream session. Protected by management API key."""
+    if request.headers.get("x-api-key") != MANAGEMENT_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    for search_dir in [Path(DVR_PATH) / "live", Path(DVR_PATH)]:
+        f = search_dir / f"{video_id}.mp4"
+        if f.exists():
+            return FileResponse(str(f), media_type="video/mp4", filename=f"{video_id}.mp4")
+    raise HTTPException(status_code=404, detail="DVR file not found")
+
+
+@app.get("/hls-archive/{stream_key}/{filename}")
+async def serve_hls_file(stream_key: str, filename: str, request: Request):
+    """Serve a single HLS segment or m3u8 for archival upload. Protected by management API key."""
+    if request.headers.get("x-api-key") != MANAGEMENT_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    f = Path(HLS_PATH) / "live" / stream_key / filename
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="HLS file not found")
+    ct = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
+    return FileResponse(str(f), media_type=ct)
+
+
+@app.delete("/stream/source/{video_id}")
+async def delete_stream_source(video_id: str, request: Request):
+    """Delete DVR MP4 and HLS segments after successful upload by the recordings worker."""
+    if request.headers.get("x-api-key") != MANAGEMENT_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    deleted = []
+
+    # Delete MP4
+    for search_dir in [Path(DVR_PATH) / "live", Path(DVR_PATH)]:
+        f = search_dir / f"{video_id}.mp4"
+        if f.exists():
+            f.unlink()
+            deleted.append(f"dvr/{f.name}")
+
+    # Look up stream_key from Redis to find the HLS dir
+    stream_key = None
+    if redis_client:
+        stream_key = await redis_client.get(f"video:{video_id}:stream_key")
+    if stream_key:
+        hls_dir = Path(HLS_PATH) / "live" / stream_key
+        if hls_dir.exists():
+            import shutil
+            shutil.rmtree(hls_dir, ignore_errors=True)
+            deleted.append(f"hls/{stream_key}/")
+        await redis_client.delete(f"video:{video_id}:stream_key", f"stream:{stream_key}:video_id")
+
+    log.info(f"Source files deleted for {video_id}: {deleted}")
+    return {"deleted": deleted}
+
 
 # ── Management APIs ───────────────────────────────────────────────────────────
 
