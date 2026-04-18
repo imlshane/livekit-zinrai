@@ -635,10 +635,17 @@ async def on_publish(request: Request):
         "client_id":  client_id,
         "app":        app_name,
         "username":   username,
+        "event_id":   educator.get("event_id"),
     }
     log.info(f"Stream started: {stream_key} by '{username}' ({len(active_streams)} active)")
 
     asyncio.create_task(r_stream_start(stream_key, client_id, username))
+
+    # Cache event_id → stream_key so /stream-token can resolve without a DB call
+    if redis_client and educator.get("event_id"):
+        asyncio.create_task(
+            redis_client.set(f"event:{educator['event_id']}:stream_key", stream_key, ex=TOKEN_TTL)
+        )
 
     # Register a Video record in recordings platform — video_id cached in Redis for on_dvr
     if RECORD_URL:
@@ -1001,6 +1008,44 @@ async def delete_stream_source(video_id: str, request: Request):
 
     log.info(f"Source files deleted for {video_id}: {deleted}")
     return {"deleted": deleted}
+
+
+# ── Public viewer token endpoint ─────────────────────────────────────────────
+
+@app.get("/stream-token")
+async def get_stream_token(event_id: str, viewer_id: Optional[str] = None):
+    """
+    Public endpoint — no API key required.
+    Resolves event_id → stream_key via Redis → returns a one-time viewer token.
+    Only works while the stream is live (Redis key exists).
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not configured.")
+
+    stream_key = await redis_client.get(f"event:{event_id}:stream_key")
+    if not stream_key:
+        raise HTTPException(status_code=404, detail="No live stream found for this event.")
+
+    token = secrets.token_urlsafe(32)
+    viewer_tokens[token] = {
+        "stream_key": stream_key,
+        "viewer_id":  viewer_id,
+        "expires_at": time.time() + TOKEN_TTL,
+        "created_at": time.time(),
+        "used":       False,
+        "used_at":    None,
+    }
+    log.info(f"Token issued for event={event_id} stream={stream_key} viewer={viewer_id or 'anonymous'}")
+
+    srs_host = os.environ.get("SRS_PUBLIC_HOST", "")  # e.g. livestream.zinrai.live
+    return {
+        "token":      token,
+        "stream_key": stream_key,
+        "expires_in": TOKEN_TTL,
+        "player_url": f"/player?stream={stream_key}&token={token}",
+        "hls_url":    f"https://{srs_host}/live/{stream_key}.m3u8?token={token}" if srs_host else None,
+        "webrtc_url": f"webrtc://{srs_host}/live/{stream_key}" if srs_host else None,
+    }
 
 
 # ── Management APIs ───────────────────────────────────────────────────────────
