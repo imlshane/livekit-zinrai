@@ -291,8 +291,12 @@ async def _register_video_task(stream_key: str, username: str, educator_id: Opti
 
 
 def generate_vod_m3u8(stream_key: str, app: str = "live") -> Optional[Path]:
-    """Build a complete VOD m3u8 from all .ts files in the HLS dir and save it alongside them."""
-    hls_dir = Path(HLS_PATH) / app / stream_key
+    """Build a complete VOD m3u8 from all .ts files and save it in the same HLS dir.
+
+    SRS stores HLS files flat: {HLS_PATH}/{app}/{stream_key}-{seq}.ts
+    (no per-stream subdirectory).
+    """
+    hls_dir = Path(HLS_PATH) / app
     if not hls_dir.exists():
         return None
     ts_files = sorted(
@@ -938,10 +942,14 @@ async def serve_dvr_file(video_id: str, request: Request):
 
 @app.get("/hls-archive/{stream_key}/{filename}")
 async def serve_hls_file(stream_key: str, filename: str, request: Request):
-    """Serve a single HLS segment or m3u8 for archival upload. Protected by management API key."""
+    """Serve a single HLS segment or m3u8 for archival upload. Protected by management API key.
+
+    SRS stores files flat: {HLS_PATH}/live/{stream_key}-{seq}.ts (no subdirectory per stream).
+    The stream_key path segment is for URL namespacing only.
+    """
     if request.headers.get("x-api-key") != MANAGEMENT_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
-    f = Path(HLS_PATH) / "live" / stream_key / filename
+    f = Path(HLS_PATH) / "live" / filename
     if not f.exists():
         raise HTTPException(status_code=404, detail="HLS file not found")
     ct = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
@@ -968,11 +976,11 @@ async def delete_stream_source(video_id: str, request: Request):
     if redis_client:
         stream_key = await redis_client.get(f"video:{video_id}:stream_key")
     if stream_key:
-        hls_dir = Path(HLS_PATH) / "live" / stream_key
-        if hls_dir.exists():
-            import shutil
-            shutil.rmtree(hls_dir, ignore_errors=True)
-            deleted.append(f"hls/{stream_key}/")
+        # SRS stores files flat: /hls/live/{stream_key}-*.ts — delete all matching files
+        hls_live = Path(HLS_PATH) / "live"
+        for f in hls_live.glob(f"{stream_key}*"):
+            f.unlink(missing_ok=True)
+            deleted.append(f"hls/live/{f.name}")
         await redis_client.delete(f"video:{video_id}:stream_key", f"stream:{stream_key}:video_id")
 
     log.info(f"Source files deleted for {video_id}: {deleted}")
