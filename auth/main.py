@@ -764,6 +764,7 @@ async def convert_and_upload(flv_path: str, stream_key: str):
             log.error(f"ffmpeg failed: {stderr.decode()[-500:]}")
             return
         log.info(f"Conversion done: {mp4} ({mp4.stat().st_size // 1024 // 1024} MB)")
+        flv.unlink()
     except FileNotFoundError:
         log.warning("ffmpeg not installed — skipping conversion. Install ffmpeg in auth container.")
         return
