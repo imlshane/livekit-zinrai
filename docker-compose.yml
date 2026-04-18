@@ -53,7 +53,7 @@ services:
     volumes:
       - auth-db:/data
       - ./dvr:/dvr
-      - ./hls:/hls:ro
+      - ./hls:/hls
 
   nginx:
     image: nginx:alpine

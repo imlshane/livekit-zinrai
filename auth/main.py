@@ -846,8 +846,11 @@ async def convert_and_upload(flv_path: str, stream_key: str):
     else:
         log.warning(f"No video_id in Redis for {stream_key} — file stays as {mp4.name}")
 
-    # Generate a complete VOD m3u8 from all HLS segments accumulated during the stream
-    generate_vod_m3u8(stream_key)
+    # Generate a complete VOD m3u8 — non-fatal if HLS dir is empty or write fails
+    try:
+        generate_vod_m3u8(stream_key)
+    except Exception as e:
+        log.warning(f"VOD m3u8 generation failed for {stream_key}: {e}")
 
     # Pop analytics (queued by on_unpublish)
     queue = stream_final_stats.get(stream_key, [])
