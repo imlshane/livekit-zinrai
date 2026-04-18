@@ -42,6 +42,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:////data/auth.db")
 SECRET_KEY   = os.environ.get("SECRET_KEY", "local-dev-secret")
 DVR_PATH     = os.environ.get("DVR_PATH", "/dvr")
+HLS_PATH     = os.environ.get("HLS_PATH", "/hls")
 S3_ENDPOINT  = os.environ.get("S3_ENDPOINT", "")
 S3_BUCKET    = os.environ.get("S3_BUCKET", "streams")
 S3_ACCESS    = os.environ.get("S3_ACCESS_KEY", "")
@@ -770,8 +771,10 @@ async def convert_and_upload(flv_path: str, stream_key: str):
         return
 
     r2_key = None
+    r2_hls_key = None
     if S3_ENDPOINT and S3_ACCESS:
-        r2_key = await upload_to_r2(mp4, stream_key)
+        r2_key     = await upload_to_r2(mp4, stream_key)
+        r2_hls_key = await upload_hls_to_r2(stream_key)
     else:
         log.info("S3 not configured — mp4 saved locally at " + str(mp4))
 
@@ -783,16 +786,56 @@ async def convert_and_upload(flv_path: str, stream_key: str):
         stream_final_stats.pop(stream_key, None)
 
     if r2_key and RECORD_URL:
-        asyncio.create_task(push_event("/stream/ingest", {
+        payload = {
             "stream_key":          stream_key,
             "r2_raw_path":         r2_key,
             "total_views":         session_stats.get("total_views", 0),
             "unique_viewers":      session_stats.get("unique_viewers", 0),
             "total_watch_seconds": session_stats.get("total_watch_seconds", 0),
             "started_at":          session_stats.get("started_at"),
-        }))
+        }
+        if r2_hls_key:
+            payload["r2_hls_live_path"] = r2_hls_key
+        asyncio.create_task(push_event("/stream/ingest", payload))
     elif not RECORD_URL:
         log.info(f"RECORD_URL not set — skipping ingest call for {stream_key}")
+
+async def upload_hls_to_r2(stream_key: str, app: str = "live") -> Optional[str]:
+    """Upload all HLS segments + m3u8 for a stream to R2. Returns the m3u8 key, or None on failure."""
+    hls_dir = Path(HLS_PATH) / app / stream_key
+    if not hls_dir.exists():
+        log.warning(f"HLS dir not found: {hls_dir}")
+        return None
+
+    files = list(hls_dir.glob("*.ts")) + list(hls_dir.glob("*.m3u8"))
+    if not files:
+        log.warning(f"No HLS files found in {hls_dir}")
+        return None
+
+    try:
+        import boto3
+        from botocore.config import Config
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS,
+            aws_secret_access_key=S3_SECRET,
+            config=Config(signature_version="s3v4"),
+        )
+        prefix = f"hls-live/{stream_key}"
+        for f in files:
+            key = f"{prefix}/{f.name}"
+            content_type = "application/vnd.apple.mpegurl" if f.suffix == ".m3u8" else "video/mp2t"
+            s3.upload_file(str(f), S3_BUCKET, key, ExtraArgs={"ContentType": content_type})
+
+        m3u8_key = f"{prefix}/{stream_key}.m3u8"
+        log.info(f"HLS uploaded to R2: {prefix}/ ({len(files)} files)")
+        return m3u8_key
+    except Exception as e:
+        log.error(f"HLS R2 upload failed for {stream_key}: {e}")
+        return None
+
 
 async def upload_to_r2(mp4: Path, stream_key: str) -> Optional[str]:
     """Upload mp4 to R2. Returns the R2 object key, or None on failure."""
