@@ -1,16 +1,5 @@
 services:
 
-  redis:
-    image: redis:7-alpine
-    container_name: srs-redis
-    restart: unless-stopped
-    networks:
-      default:
-        ipv4_address: 172.20.0.3
-    volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
-
   srs:
     image: ossrs/srs:5
     container_name: srs-origin
@@ -52,7 +41,8 @@ services:
       - HLS_PATH=/hls
       - RECORD_URL=${RECORD_URL:-}
       - RECORD_API_KEY=${RECORD_API_KEY:-}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - REDIS_URL=${REDIS_URL}
+      - REDIS_PREFIX=${REDIS_PREFIX:-zinrai:live:}
       - MANAGEMENT_API_KEY=${MANAGEMENT_API_KEY:-}
       - VIEWER_TOKEN_API_KEY=${VIEWER_TOKEN_API_KEY:-}
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
@@ -68,8 +58,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    depends_on:
-      - redis
+    depends_on: []
     volumes:
       - auth-db:/data
       - ./dvr:/dvr
@@ -98,7 +87,6 @@ services:
 
 volumes:
   auth-db:
-  redis-data:
 
 networks:
   default:

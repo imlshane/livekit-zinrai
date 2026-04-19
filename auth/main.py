@@ -52,8 +52,9 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
 SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
-REDIS_URL           = os.environ.get("REDIS_URL", "")
-MANAGEMENT_API_KEY  = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
+REDIS_URL            = os.environ.get("REDIS_URL", "")
+REDIS_PREFIX         = os.environ.get("REDIS_PREFIX", "zinrai:live:")
+MANAGEMENT_API_KEY   = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
 VIEWER_TOKEN_API_KEY = os.environ.get("VIEWER_TOKEN_API_KEY", "")  # LMS / frontend token generation only
 
 MAX_PUBLISHERS          = 6
@@ -146,7 +147,9 @@ async def init_redis() -> None:
         return
     try:
         import redis.asyncio as aioredis
-        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis_client = aioredis.from_url(
+            REDIS_URL, decode_responses=True, ssl_cert_reqs=None
+        )
         await redis_client.ping()
         log.info(f"Redis connected: {REDIS_URL}")
     except Exception as e:
@@ -167,14 +170,14 @@ async def r_stream_start(stream_key: str, client_id: str, username: str) -> None
     try:
         now = time.time()
         pipe = redis_client.pipeline()
-        pipe.set(f"stream:{stream_key}:status",     "live")
-        pipe.set(f"stream:{stream_key}:started_at", now)
-        pipe.set(f"stream:{stream_key}:client_id",  client_id)
-        pipe.set(f"stream:{stream_key}:username",   username)
-        pipe.set(f"stream:{stream_key}:views",      0)
-        pipe.set(f"stream:{stream_key}:watch_seconds", 0)
-        pipe.delete(f"stream:{stream_key}:unique_viewers")
-        pipe.delete(f"stream:{stream_key}:sessions")
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:status",     "live")
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:started_at", now)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:client_id",  client_id)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:username",   username)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:views",      0)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:watch_seconds", 0)
+        pipe.delete(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers")
+        pipe.delete(f"{REDIS_PREFIX}stream:{stream_key}:sessions")
         await pipe.execute()
     except Exception as e:
         log.warning(f"Redis r_stream_start failed: {e}")
@@ -186,13 +189,13 @@ async def r_stream_end(stream_key: str) -> dict:
         return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
     try:
         pipe = redis_client.pipeline()
-        pipe.get(f"stream:{stream_key}:started_at")
-        pipe.get(f"stream:{stream_key}:views")
-        pipe.get(f"stream:{stream_key}:watch_seconds")
-        pipe.pfcount(f"stream:{stream_key}:unique_viewers")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:started_at")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:views")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:watch_seconds")
+        pipe.pfcount(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers")
         results = await pipe.execute()
 
-        await redis_client.set(f"stream:{stream_key}:status", "ended")
+        await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:status", "ended")
 
         return {
             "started_at":          float(results[0] or time.time()),
@@ -210,9 +213,9 @@ async def r_viewer_join(stream_key: str, viewer_id: str, client_id: str) -> None
         return
     try:
         pipe = redis_client.pipeline()
-        pipe.incr(f"stream:{stream_key}:views")
-        pipe.pfadd(f"stream:{stream_key}:unique_viewers", viewer_id)
-        pipe.hset(f"stream:{stream_key}:sessions", client_id, time.time())
+        pipe.incr(f"{REDIS_PREFIX}stream:{stream_key}:views")
+        pipe.pfadd(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers", viewer_id)
+        pipe.hset(f"{REDIS_PREFIX}stream:{stream_key}:sessions", client_id, time.time())
         await pipe.execute()
     except Exception as e:
         log.warning(f"Redis r_viewer_join failed: {e}")
@@ -223,8 +226,8 @@ async def r_viewer_leave(stream_key: str, client_id: str, watch_seconds: int) ->
         return
     try:
         pipe = redis_client.pipeline()
-        pipe.incrby(f"stream:{stream_key}:watch_seconds", watch_seconds)
-        pipe.hdel(f"stream:{stream_key}:sessions", client_id)
+        pipe.incrby(f"{REDIS_PREFIX}stream:{stream_key}:watch_seconds", watch_seconds)
+        pipe.hdel(f"{REDIS_PREFIX}stream:{stream_key}:sessions", client_id)
         await pipe.execute()
     except Exception as e:
         log.warning(f"Redis r_viewer_leave failed: {e}")
@@ -289,8 +292,8 @@ async def _register_video_task(stream_key: str, username: str, educator_id: Opti
         if resp.is_success:
             video_id = resp.json().get("video_id")
             if video_id and redis_client:
-                await redis_client.set(f"stream:{stream_key}:video_id", video_id, ex=86400)
-                await redis_client.set(f"video:{video_id}:stream_key", stream_key, ex=86400)
+                await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:video_id", video_id, ex=86400)
+                await redis_client.set(f"{REDIS_PREFIX}video:{video_id}:stream_key", stream_key, ex=86400)
             log.info(f"Video registered: {video_id} for stream {stream_key}")
         else:
             log.warning(f"Video registration failed: HTTP {resp.status_code} — {resp.text[:200]}")
@@ -644,7 +647,7 @@ async def on_publish(request: Request):
     # Cache event_id → stream_key so /stream-token can resolve without a DB call
     if redis_client and educator.get("event_id"):
         asyncio.create_task(
-            redis_client.set(f"event:{educator['event_id']}:stream_key", stream_key, ex=TOKEN_TTL)
+            redis_client.set(f"{REDIS_PREFIX}event:{educator['event_id']}:stream_key", stream_key, ex=TOKEN_TTL)
         )
 
     # Register a Video record in recordings platform — video_id cached in Redis for on_dvr
@@ -857,7 +860,7 @@ async def convert_and_upload(flv_path: str, stream_key: str):
     # Rename MP4 to {video_id}.mp4 so recordings worker can fetch it by video_id
     video_id = None
     if redis_client:
-        video_id = await redis_client.get(f"stream:{stream_key}:video_id")
+        video_id = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
     if video_id:
         named_mp4 = mp4.parent / f"{video_id}.mp4"
         mp4.rename(named_mp4)
@@ -997,14 +1000,14 @@ async def delete_stream_source(video_id: str, request: Request):
     # Look up stream_key from Redis to find the HLS dir
     stream_key = None
     if redis_client:
-        stream_key = await redis_client.get(f"video:{video_id}:stream_key")
+        stream_key = await redis_client.get(f"{REDIS_PREFIX}video:{video_id}:stream_key")
     if stream_key:
         # SRS stores files flat: /hls/live/{stream_key}-*.ts — delete all matching files
         hls_live = Path(HLS_PATH) / "live"
         for f in hls_live.glob(f"{stream_key}*"):
             f.unlink(missing_ok=True)
             deleted.append(f"hls/live/{f.name}")
-        await redis_client.delete(f"video:{video_id}:stream_key", f"stream:{stream_key}:video_id")
+        await redis_client.delete(f"{REDIS_PREFIX}video:{video_id}:stream_key", f"{REDIS_PREFIX}stream:{stream_key}:video_id")
 
     log.info(f"Source files deleted for {video_id}: {deleted}")
     return {"deleted": deleted}
@@ -1022,7 +1025,7 @@ async def get_stream_token(event_id: str, viewer_id: Optional[str] = None):
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not configured.")
 
-    stream_key = await redis_client.get(f"event:{event_id}:stream_key")
+    stream_key = await redis_client.get(f"{REDIS_PREFIX}event:{event_id}:stream_key")
     if not stream_key:
         raise HTTPException(status_code=404, detail="No live stream found for this event.")
 
@@ -1191,12 +1194,12 @@ async def stream_stats(stream_key: str, _: None = Depends(require_api_key)):
         raise HTTPException(503, "Redis not configured")
     try:
         pipe = redis_client.pipeline()
-        pipe.get(f"stream:{stream_key}:status")
-        pipe.get(f"stream:{stream_key}:started_at")
-        pipe.get(f"stream:{stream_key}:views")
-        pipe.get(f"stream:{stream_key}:watch_seconds")
-        pipe.pfcount(f"stream:{stream_key}:unique_viewers")
-        pipe.hlen(f"stream:{stream_key}:sessions")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:status")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:started_at")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:views")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:watch_seconds")
+        pipe.pfcount(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers")
+        pipe.hlen(f"{REDIS_PREFIX}stream:{stream_key}:sessions")
         results = await pipe.execute()
 
         if not results[0]:
