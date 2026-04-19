@@ -53,9 +53,9 @@ services:
     mem_limit: 512m
     memswap_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
       interval: 15s
-      timeout: 5s
+      timeout: 6s
       retries: 3
       start_period: 10s
     depends_on: []
