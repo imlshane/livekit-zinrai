@@ -197,12 +197,14 @@ async def r_stream_end(stream_key: str) -> dict:
 
         await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:status", "ended")
 
-        return {
+        stats = {
             "started_at":          float(results[0] or time.time()),
             "total_views":         int(results[1] or 0),
             "total_watch_seconds": int(results[2] or 0),
             "unique_viewers":      int(results[3] or 0),
         }
+        log.info(f"r_stream_end {stream_key}: views={stats['total_views']} unique={stats['unique_viewers']} watch={stats['total_watch_seconds']}s")
+        return stats
     except Exception as e:
         log.warning(f"Redis r_stream_end failed: {e}")
         return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
@@ -767,7 +769,7 @@ async def on_play(request: Request):
 
     log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id} ip={ip_address}")
 
-    asyncio.create_task(r_viewer_join(stream_key, viewer_id, client_id))
+    await r_viewer_join(stream_key, viewer_id, client_id)
 
     # Push viewer.joined to recordings platform (non-blocking)
     fire("/stream-analytics/viewers/join", {
@@ -875,11 +877,18 @@ async def convert_and_upload(flv_path: str, stream_key: str):
     except Exception as e:
         log.warning(f"VOD m3u8 generation failed for {stream_key}: {e}")
 
-    # Pop analytics (queued by on_unpublish)
+    # Pop analytics (queued by on_unpublish).
+    # Wait up to 5s in case on_dvr fired before on_unpublish (SRS timing edge case).
+    for _wait in range(10):
+        if stream_key in stream_final_stats:
+            break
+        await asyncio.sleep(0.5)
     queue = stream_final_stats.get(stream_key, [])
     session_stats = queue.pop(0) if queue else {}
     if not queue:
         stream_final_stats.pop(stream_key, None)
+    if not session_stats:
+        log.warning(f"convert_and_upload {stream_key}: stream_final_stats empty — stats will be 0")
 
     # Finalize the Video record — recordings worker will pick it up and upload
     if video_id and RECORD_URL:
