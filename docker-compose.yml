@@ -18,6 +18,7 @@ services:
     memswap_limit: 3g
     volumes:
       - ./srs/origin.conf:/usr/local/srs/conf/srs.conf
+      - ./srs/logs:/usr/local/srs/logs
       - ./dvr:/dvr
       - ./hls:/usr/local/srs/objs/nginx/hls
     depends_on:
