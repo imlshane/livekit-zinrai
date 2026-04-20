@@ -1189,6 +1189,7 @@ def list_streams(_: None = Depends(require_api_key)):
         {
             "stream_key":         k,
             "username":           v["username"],
+            "event_id":           v.get("event_id"),
             "duration_s":         int(now - v["started_at"]),
             "app":                v["app"],
             "concurrent_viewers": viewers_per_stream.get(k, 0),
