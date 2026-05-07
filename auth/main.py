@@ -61,6 +61,7 @@ MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
 STREAM_WARN_BEFORE_SEC  = 600    # warn 10 minutes before hard stop
 TOKEN_TTL               = 7200   # seconds — matches 2h max stream duration
+RECONNECT_GRACE_SEC     = int(os.environ.get("RECONNECT_GRACE_SEC", "30"))  # window to treat a reconnect as session resume
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -135,6 +136,14 @@ active_viewers: dict[str, dict] = {}   # client_id → {stream_key, viewer_id, t
 # don't overwrite each other.  on_unpublish appends; on_dvr/convert_and_upload pops oldest.
 stream_final_stats: dict[str, list[dict]] = {}
 
+# Reconnect grace window state — stream_key → pending reconnect info.
+# Populated by on_unpublish; cleared by reconnect (on_publish) or grace timer expiry.
+pending_reconnect: dict[str, dict] = {}
+
+# DVR chunk coordination — tracks converted MP4 parts for sessions with mid-stream drops.
+session_dvr_chunks:  dict[str, list] = {}  # stream_key → [Path, ...]
+session_dvr_pending: dict[str, int]  = {}  # stream_key → outstanding FLV conversions
+
 # ── Redis ─────────────────────────────────────────────────────────────────────
 
 redis_client = None   # set in lifespan if REDIS_URL is configured
@@ -208,6 +217,45 @@ async def r_stream_end(stream_key: str) -> dict:
     except Exception as e:
         log.warning(f"Redis r_stream_end failed: {e}")
         return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
+
+
+async def r_stream_stats_only(stream_key: str) -> dict:
+    """Read current analytics without marking the stream as ended (used during grace window)."""
+    if not redis_client:
+        return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
+    try:
+        pipe = redis_client.pipeline()
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:started_at")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:views")
+        pipe.get(f"{REDIS_PREFIX}stream:{stream_key}:watch_seconds")
+        pipe.pfcount(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers")
+        results = await pipe.execute()
+        return {
+            "started_at":          float(results[0] or time.time()),
+            "total_views":         int(results[1] or 0),
+            "total_watch_seconds": int(results[2] or 0),
+            "unique_viewers":      int(results[3] or 0),
+        }
+    except Exception as e:
+        log.warning(f"r_stream_stats_only failed: {e}")
+        return {"started_at": time.time(), "total_views": 0, "unique_viewers": 0, "total_watch_seconds": 0}
+
+
+async def r_stream_resume(stream_key: str, client_id: str, username: str, original_started_at: float) -> None:
+    """Re-initialise Redis live state for a reconnected stream, preserving the original start time
+    and accumulated analytics counters."""
+    if not redis_client:
+        return
+    try:
+        pipe = redis_client.pipeline()
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:status",     "live")
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:started_at", original_started_at)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:client_id",  client_id)
+        pipe.set(f"{REDIS_PREFIX}stream:{stream_key}:username",   username)
+        # views / watch_seconds / unique_viewers are left intact — they accumulated from before
+        await pipe.execute()
+    except Exception as e:
+        log.warning(f"Redis r_stream_resume failed: {e}")
 
 
 async def r_viewer_join(stream_key: str, viewer_id: str, client_id: str) -> None:
@@ -301,6 +349,147 @@ async def _register_video_task(stream_key: str, username: str, educator_id: Opti
             log.warning(f"Video registration failed: HTTP {resp.status_code} — {resp.text[:200]}")
     except Exception as e:
         log.error(f"Video registration error for {stream_key}: {e}")
+
+
+async def _grace_window_expire(stream_key: str) -> None:
+    """
+    Fires RECONNECT_GRACE_SEC after an on_unpublish.
+    If the publisher hasn't reconnected by then, the session is truly over:
+    finalise Redis state, push sessions/end, and kick off chunk assembly if all
+    DVR conversions are already done.
+    """
+    await asyncio.sleep(RECONNECT_GRACE_SEC)
+
+    if stream_key not in pending_reconnect:
+        return  # reconnect already cancelled us
+
+    pending_reconnect.pop(stream_key, None)
+
+    final_stats = await r_stream_end(stream_key)
+    duration_s  = int(time.time() - final_stats["started_at"])
+
+    stream_final_stats.setdefault(stream_key, []).append({
+        "total_views":         final_stats["total_views"],
+        "unique_viewers":      final_stats["unique_viewers"],
+        "total_watch_seconds": final_stats["total_watch_seconds"],
+        "started_at":          final_stats["started_at"],
+    })
+
+    fire("/stream-analytics/sessions/end", {
+        "stream_key":          stream_key,
+        "total_views":         final_stats["total_views"],
+        "unique_viewers":      final_stats["unique_viewers"],
+        "total_watch_seconds": final_stats["total_watch_seconds"],
+        "peak_concurrent":     0,
+    })
+
+    log.info(
+        f"Grace window expired — session finalised: {stream_key} "
+        f"duration={duration_s}s views={final_stats['total_views']}"
+    )
+
+    # If all DVR conversions already completed while we were in the grace window,
+    # assemble the final MP4 now (no more on_dvr will arrive).
+    if session_dvr_pending.get(stream_key, 0) == 0 and stream_key in session_dvr_chunks:
+        log.info(f"All DVR chunks pre-converted — assembling now: {stream_key}")
+        asyncio.create_task(_assemble_and_finalise(stream_key))
+
+
+async def concat_mp4_parts(parts: list, output: Path) -> bool:
+    """Concatenate MP4 files using the ffmpeg concat demuxer. Returns True on success."""
+    concat_list = output.parent / f"_concat_{int(time.time())}.txt"
+    try:
+        concat_list.write_text("\n".join(f"file '{p.resolve()}'" for p in parts) + "\n")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy", "-movflags", "+faststart",
+            str(output),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            log.error(f"concat_mp4_parts failed: {stderr.decode()[-500:]}")
+            return False
+        log.info(f"Concatenated {len(parts)} parts → {output.name}")
+        return True
+    except Exception as e:
+        log.error(f"concat_mp4_parts error: {e}")
+        return False
+    finally:
+        concat_list.unlink(missing_ok=True)
+
+
+async def _assemble_and_finalise(stream_key: str) -> None:
+    """
+    Concat all stashed DVR chunks for stream_key into one {video_id}.mp4,
+    then push /stream/finalize.  Called either from convert_and_upload (when the
+    last pending conversion finishes) or from _grace_window_expire (when all
+    conversions beat the grace timer).
+    """
+    chunks = session_dvr_chunks.pop(stream_key, [])
+    session_dvr_pending.pop(stream_key, None)
+
+    if not chunks:
+        return
+
+    video_id = None
+    if redis_client:
+        try:
+            video_id = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        except Exception:
+            pass
+
+    base_dir = chunks[0].parent
+
+    if len(chunks) == 1:
+        mp4 = chunks[0]
+    else:
+        final_mp4 = base_dir / f"{video_id or stream_key}-assembled.mp4"
+        ok = await concat_mp4_parts(chunks, final_mp4)
+        if ok:
+            for c in chunks:
+                c.unlink(missing_ok=True)
+            mp4 = final_mp4
+        else:
+            mp4 = chunks[-1]
+            for c in chunks[:-1]:
+                c.unlink(missing_ok=True)
+
+    if video_id:
+        named_mp4 = mp4.parent / f"{video_id}.mp4"
+        mp4.rename(named_mp4)
+        mp4 = named_mp4
+        log.info(f"Assembled MP4 renamed to {mp4.name}")
+    else:
+        log.warning(f"No video_id in Redis for {stream_key} — assembled file stays as {mp4.name}")
+
+    try:
+        generate_vod_m3u8(stream_key)
+    except Exception as e:
+        log.warning(f"VOD m3u8 generation failed for {stream_key}: {e}")
+
+    # Wait for stats (stashed by _grace_window_expire or _grace_window_expire→on_unpublish)
+    for _ in range(10):
+        if stream_key in stream_final_stats:
+            break
+        await asyncio.sleep(0.5)
+
+    queue = stream_final_stats.get(stream_key, [])
+    session_stats = queue.pop(0) if queue else {}
+    if not queue:
+        stream_final_stats.pop(stream_key, None)
+
+    if video_id and RECORD_URL:
+        asyncio.create_task(push_event(f"/stream/finalize/{video_id}", {
+            "total_views":         session_stats.get("total_views", 0),
+            "unique_viewers":      session_stats.get("unique_viewers", 0),
+            "total_watch_seconds": session_stats.get("total_watch_seconds", 0),
+            "started_at":          session_stats.get("started_at"),
+        }))
+    elif not RECORD_URL:
+        log.info(f"RECORD_URL not set — skipping finalize for {stream_key}")
 
 
 def generate_vod_m3u8(stream_key: str, app: str = "live") -> Optional[Path]:
@@ -538,6 +727,9 @@ async def ghost_stream_reconciler() -> None:
             ghosts      = auth_active - srs_live
 
             for ghost in ghosts:
+                # on_unpublish already moved this into pending_reconnect — not a ghost
+                if ghost in pending_reconnect:
+                    continue
                 log.warning(f"Ghost stream removed: {ghost} (in auth state but not in SRS)")
                 active_streams.pop(ghost, None)
 
@@ -629,11 +821,40 @@ async def on_publish(request: Request):
     username = educator.get("name", stream_key)
     log.info(f"Educator validated: '{username}' (id={educator.get('id')})")
 
+    # ── Reconnect within grace window — resume the same session ─────────────────
+    recon = pending_reconnect.pop(stream_key, None)
+    if recon:
+        recon["grace_task"].cancel()
+
+        active_streams[stream_key] = {
+            "started_at": recon["started_at"],   # preserve original session start time
+            "client_id":  client_id,
+            "app":        app_name,
+            "username":   username,
+            "event_id":   educator.get("event_id"),
+        }
+
+        # Increment pending DVR count — this new connection will produce another FLV file
+        session_dvr_pending[stream_key] = session_dvr_pending.get(stream_key, 0) + 1
+
+        asyncio.create_task(r_stream_resume(stream_key, client_id, username, recon["started_at"]))
+
+        log.info(
+            f"Stream RECONNECTED (grace window): {stream_key} by '{username}' "
+            f"— reusing session, video_id={recon.get('video_id')}"
+        )
+        return srs_ok()
+
+    # ── New session ───────────────────────────────────────────────────────────────
     if stream_key in active_streams:
         return srs_deny(f"Stream key already in use: {stream_key}")
 
     if len(active_streams) >= MAX_PUBLISHERS:
         return srs_deny(f"Max publisher limit ({MAX_PUBLISHERS}) reached")
+
+    # Clear any stale DVR state from a previous (fully ended) session with the same key
+    session_dvr_pending.pop(stream_key, None)
+    session_dvr_chunks.pop(stream_key, None)
 
     active_streams[stream_key] = {
         "started_at": time.time(),
@@ -642,6 +863,9 @@ async def on_publish(request: Request):
         "username":   username,
         "event_id":   educator.get("event_id"),
     }
+    # Track that this initial connection will produce one DVR file
+    session_dvr_pending[stream_key] = 1
+
     log.info(f"Stream started: {stream_key} by '{username}' ({len(active_streams)} active)")
 
     asyncio.create_task(r_stream_start(stream_key, client_id, username))
@@ -667,41 +891,42 @@ async def on_publish(request: Request):
 
 @app.post("/on_unpublish")
 async def on_unpublish(request: Request):
-    """OBS stopped streaming."""
+    """OBS stopped streaming (or dropped due to network instability)."""
     body = await request.json()
     stream_key = body.get("stream", "")
     log.info(f"on_unpublish: stream={stream_key}")
 
-    stream_info = active_streams.pop(stream_key, {})
+    active_streams.pop(stream_key, {})
 
     # Close any still-open viewer sessions in memory (abrupt exits)
     abrupt_exits = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
     for cid in abrupt_exits:
         active_viewers.pop(cid, None)
 
-    # Get real analytics from Redis, then push stream.ended
-    stats      = await r_stream_end(stream_key)
-    started_at = stats["started_at"]
-    duration_s = int(time.time() - started_at)
+    # Snapshot current analytics without marking the session ended — the publisher
+    # may reconnect within the grace window and we want to preserve the session.
+    stats = await r_stream_stats_only(stream_key)
 
-    # Stash analytics for this session so on_dvr can pass them to /stream/ingest.
-    # Use a FIFO list per stream_key so rapid back-to-back sessions don't clobber each other.
-    stream_final_stats.setdefault(stream_key, []).append({
-        "total_views":         stats["total_views"],
-        "unique_viewers":      stats["unique_viewers"],
-        "total_watch_seconds": stats["total_watch_seconds"],
-        "started_at":          started_at,
-    })
+    # Look up the video_id so a reconnect can reuse it without a new /stream/register call.
+    video_id = None
+    if redis_client:
+        try:
+            video_id = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        except Exception:
+            pass
 
-    fire("/stream-analytics/sessions/end", {
-        "stream_key":          stream_key,
-        "total_views":         stats["total_views"],
-        "unique_viewers":      stats["unique_viewers"],
-        "total_watch_seconds": stats["total_watch_seconds"],
-        "peak_concurrent":     0,
-    })
+    grace_task = asyncio.create_task(_grace_window_expire(stream_key))
+    pending_reconnect[stream_key] = {
+        "video_id":   video_id,
+        "started_at": stats["started_at"],
+        "stats":      stats,
+        "grace_task": grace_task,
+    }
 
-    log.info(f"Stream ended: {stream_key} duration={duration_s}s views={stats['total_views']} unique={stats['unique_viewers']}")
+    log.info(
+        f"Stream disconnected: {stream_key} — "
+        f"grace window {RECONNECT_GRACE_SEC}s started (video_id={video_id})"
+    )
     return srs_ok()
 
 
@@ -831,7 +1056,14 @@ async def on_dvr(request: Request):
 # ── DVR Worker ────────────────────────────────────────────────────────────────
 
 async def convert_and_upload(flv_path: str, stream_key: str):
-    """Convert .flv to .mp4 via ffmpeg, upload to R2, then trigger VOD pipeline."""
+    """
+    Convert .flv → .mp4 via ffmpeg.
+
+    For sessions with network drops the same stream_key may produce multiple FLV
+    files (one per RTMP connection).  We stash each converted chunk and only
+    concat + finalise once the session is truly over (grace window expired and all
+    pending conversions are done).
+    """
     flv = Path(flv_path)
     if not flv.exists():
         log.error(f"DVR file not found: {flv_path}")
@@ -859,10 +1091,54 @@ async def convert_and_upload(flv_path: str, stream_key: str):
         log.warning("ffmpeg not installed — skipping conversion. Install ffmpeg in auth container.")
         return
 
-    # Rename MP4 to {video_id}.mp4 so recordings worker can fetch it by video_id
+    # Decrement the outstanding-conversion counter for this logical session
+    remaining = max(0, session_dvr_pending.get(stream_key, 1) - 1)
+    session_dvr_pending[stream_key] = remaining
+
+    # If the session is still live or in the grace window, stash this chunk.
+    # _grace_window_expire / the final convert_and_upload call will assemble everything.
+    session_active = stream_key in active_streams or stream_key in pending_reconnect
+
+    if session_active or remaining > 0:
+        chunk_name = mp4.parent / f"{mp4.stem}-part{int(time.time())}.mp4"
+        mp4.rename(chunk_name)
+        session_dvr_chunks.setdefault(stream_key, []).append(chunk_name)
+        log.info(
+            f"DVR chunk stashed ({remaining} conversion(s) still pending, "
+            f"session_active={session_active}): {chunk_name.name}"
+        )
+        return
+
+    # Session is fully over and this is the last conversion — assemble now.
+    prior_chunks = session_dvr_chunks.pop(stream_key, [])
+    session_dvr_pending.pop(stream_key, None)
+    all_parts = prior_chunks + [mp4]
+
+    if len(all_parts) > 1:
+        video_id_for_name = None
+        if redis_client:
+            try:
+                video_id_for_name = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+            except Exception:
+                pass
+        final_mp4 = mp4.parent / f"{video_id_for_name or stream_key}-assembled.mp4"
+        ok = await concat_mp4_parts(all_parts, final_mp4)
+        if ok:
+            for part in all_parts:
+                part.unlink(missing_ok=True)
+            mp4 = final_mp4
+        else:
+            log.warning(f"MP4 concat failed for {stream_key} — using last chunk only")
+            for part in prior_chunks:
+                part.unlink(missing_ok=True)
+
+    # Rename to {video_id}.mp4
     video_id = None
     if redis_client:
-        video_id = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        try:
+            video_id = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        except Exception:
+            pass
     if video_id:
         named_mp4 = mp4.parent / f"{video_id}.mp4"
         mp4.rename(named_mp4)
@@ -877,12 +1153,14 @@ async def convert_and_upload(flv_path: str, stream_key: str):
     except Exception as e:
         log.warning(f"VOD m3u8 generation failed for {stream_key}: {e}")
 
-    # Pop analytics (queued by on_unpublish).
-    # Wait up to 5s in case on_dvr fired before on_unpublish (SRS timing edge case).
-    for _wait in range(10):
-        if stream_key in stream_final_stats:
-            break
+    # Pop analytics stashed by _grace_window_expire.
+    # Grace window expiry sets stream_final_stats; on_dvr fires after on_unpublish so
+    # the stats may not be ready yet — wait up to RECONNECT_GRACE_SEC + 5s.
+    wait_limit = RECONNECT_GRACE_SEC + 5
+    waited = 0
+    while stream_key not in stream_final_stats and waited < wait_limit:
         await asyncio.sleep(0.5)
+        waited += 0.5
     queue = stream_final_stats.get(stream_key, [])
     session_stats = queue.pop(0) if queue else {}
     if not queue:
