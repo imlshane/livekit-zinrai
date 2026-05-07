@@ -67,9 +67,9 @@ services:
       - ./dvr:/dvr
       - ./hls:/hls
 
-  nginx:
-    image: nginx:alpine
-    container_name: srs-nginx
+  caddy:
+    image: caddy:alpine
+    container_name: srs-caddy
     restart: unless-stopped
     ulimits:
       nofile:
@@ -80,16 +80,23 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"    # HTTP/3 (QUIC)
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL}
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/html:/usr/share/nginx/html:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./nginx/html:/srv/html:ro              # reuse existing static files
+      - caddy-data:/data                       # persists TLS certs across restarts
+      - caddy-config:/config
     depends_on:
       - srs
       - auth
 
 volumes:
   auth-db:
+  caddy-data:     # TLS certificates — persists across container restarts
+  caddy-config:
 
 networks:
   default:

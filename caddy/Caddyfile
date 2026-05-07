@@ -1,0 +1,67 @@
+{
+    # Let's Encrypt requires an email for cert issuance notifications
+    email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+
+    # ── Viewer player page ───────────────────────────────────────────────────
+    handle /player {
+        root * /srv/html
+        rewrite * /player.html
+        file_server
+        header Cache-Control no-cache
+    }
+
+    # Embeddable player JS — open CORS so external sites can include it
+    handle /embed/* {
+        root * /srv/html
+        file_server
+        header Access-Control-Allow-Origin *
+        header Cache-Control "public, max-age=300"
+    }
+
+    # ── WebRTC signaling → SRS HTTP API (port 1985) ──────────────────────────
+    handle /rtc/v1/* {
+        @preflight method OPTIONS
+        respond @preflight 204
+
+        header Access-Control-Allow-Origin  {http.request.header.Origin}
+        header Access-Control-Allow-Methods "POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type"
+        header Vary                         Origin
+
+        reverse_proxy srs:1985
+    }
+
+    # ── HLS fallback → SRS HTTP server (port 8080) ──────────────────────────
+    handle /hls/* {
+        reverse_proxy srs:8080
+        header Cache-Control no-cache
+    }
+
+    # ── SRS stats API  /api/srs/v1/... → srs:1985/api/v1/... ───────────────
+    @srs_stats path_regexp srs_rewrite ^/api/srs/(.+)$
+    handle @srs_stats {
+        rewrite * /api/{http.regexp.srs_rewrite.1}
+        reverse_proxy srs:1985
+    }
+
+    # ── Auth service API  /api/... → auth:8000/... ───────────────────────────
+    handle /api/* {
+        @preflight method OPTIONS
+        respond @preflight 204
+
+        header Access-Control-Allow-Origin  {http.request.header.Origin}
+        header Access-Control-Allow-Methods "GET, POST, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type, x-api-key"
+        header Vary                         Origin
+
+        uri strip_prefix /api
+        reverse_proxy auth:8000 {
+            header_up X-Real-IP       {remote_host}
+            header_up Host            {host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+}
