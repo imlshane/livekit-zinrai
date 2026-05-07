@@ -6,8 +6,8 @@
 |-----|-------|
 | Host | `104.131.166.150` |
 | User | `root` |
-| Git folder | `/opt/live` |
-| Compose file | `/opt/live/docker-compose.yml` |
+| Git folder | `/opt/livekit` |
+| Compose file | `/opt/livekit/docker-compose.yml` |
 
 SSH shortcut: `ssh root@104.131.166.150`
 
@@ -18,7 +18,7 @@ rather than giving instructions — the server credentials are in local memory.
 
 ```bash
 # Tail all container logs together
-ssh root@104.131.166.150 "cd /opt/live && docker compose logs -f --tail=50"
+ssh root@104.131.166.150 "cd /opt/livekit && docker compose logs -f --tail=50"
 
 # Auth service only (most relevant for stream issues)
 ssh root@104.131.166.150 "docker logs srs-auth -f --tail=100"
@@ -30,7 +30,7 @@ ssh root@104.131.166.150 "docker logs srs-caddy -f --tail=50"
 ssh root@104.131.166.150 "docker logs srs-origin -f --tail=50"
 
 # Restart + rebuild after code changes
-ssh root@104.131.166.150 "cd /opt/live && git pull && docker compose up -d --build auth"
+ssh root@104.131.166.150 "cd /opt/livekit && git pull && docker compose up -d --build auth"
 ```
 
 ## Container Names
