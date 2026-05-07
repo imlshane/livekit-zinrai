@@ -5,6 +5,8 @@ services:
     container_name: srs-origin
     restart: unless-stopped
     command: ./objs/srs -c conf/srs.conf
+    environment:
+      - CANDIDATE=${SERVER_IP}   # WebRTC ICE candidate IP — must match the server's public IP
     ports:
       - "1935:1935"                  # RTMP ingest — must be public
       - "127.0.0.1:1985:1985"        # SRS API — localhost only
