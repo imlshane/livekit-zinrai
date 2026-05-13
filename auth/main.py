@@ -258,12 +258,13 @@ async def r_stream_resume(stream_key: str, client_id: str, username: str, origin
         log.warning(f"Redis r_stream_resume failed: {e}")
 
 
-async def r_viewer_join(stream_key: str, viewer_id: str, client_id: str) -> None:
+async def r_viewer_join(stream_key: str, viewer_id: str, client_id: str, is_reconnect: bool = False) -> None:
     if not redis_client:
         return
     try:
         pipe = redis_client.pipeline()
-        pipe.incr(f"{REDIS_PREFIX}stream:{stream_key}:views")
+        if not is_reconnect:
+            pipe.incr(f"{REDIS_PREFIX}stream:{stream_key}:views")
         pipe.pfadd(f"{REDIS_PREFIX}stream:{stream_key}:unique_viewers", viewer_id)
         pipe.hset(f"{REDIS_PREFIX}stream:{stream_key}:sessions", client_id, time.time())
         await pipe.execute()
@@ -963,6 +964,7 @@ async def on_play(request: Request):
     if entry["stream_key"] and entry["stream_key"] != stream_key:
         return srs_deny(f"Token not valid for stream {stream_key}")
 
+    is_reconnect = False
     if entry.get("used"):
         # Allow reconnects from the same browser tab (same IP + same session id)
         bound_ip  = entry.get("bound_ip")
@@ -973,6 +975,7 @@ async def on_play(request: Request):
         if sid and bound_sid and sid != bound_sid:
             log.warning(f"on_play DENIED: token reuse from different session {sid} (bound to {bound_sid})")
             return srs_deny("Token already claimed by another session")
+        is_reconnect = True
     else:
         # First use — bind token to this IP and browser session
         entry["used"]      = True
@@ -992,9 +995,9 @@ async def on_play(request: Request):
         "ip_address":  ip_address,
     }
 
-    log.info(f"Viewer authenticated: stream={stream_key} viewer={viewer_id} client={client_id} ip={ip_address}")
+    log.info(f"Viewer {'reconnected' if is_reconnect else 'authenticated'}: stream={stream_key} viewer={viewer_id} client={client_id} ip={ip_address}")
 
-    await r_viewer_join(stream_key, viewer_id, client_id)
+    await r_viewer_join(stream_key, viewer_id, client_id, is_reconnect=is_reconnect)
 
     # Push viewer.joined to recordings platform (non-blocking)
     fire("/stream-analytics/viewers/join", {
