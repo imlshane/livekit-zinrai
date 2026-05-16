@@ -986,6 +986,19 @@ async def on_play(request: Request):
     viewer_id    = entry.get("viewer_id") or f"anon-{client_id}"
     is_anonymous = not bool(entry.get("viewer_id"))
 
+    # On reconnect, purge stale active_viewers entries for this viewer_id.
+    # on_stop doesn't always fire on abrupt WebRTC drops, leaving ghost entries
+    # that inflate concurrent_viewers with a different client_id each reconnect.
+    if is_reconnect:
+        stale = [cid for cid, v in list(active_viewers.items()) if v["viewer_id"] == viewer_id and cid != client_id]
+        for cid in stale:
+            active_viewers.pop(cid, None)
+            log.info(f"Purged stale viewer entry: client={cid} viewer={viewer_id}")
+            if redis_client:
+                asyncio.create_task(
+                    redis_client.hdel(f"{REDIS_PREFIX}stream:{stream_key}:sessions", cid)
+                )
+
     # Track in memory for watch_seconds calculation on on_stop
     active_viewers[client_id] = {
         "stream_key":  stream_key,
