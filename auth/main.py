@@ -364,7 +364,8 @@ async def _grace_window_expire(stream_key: str) -> None:
     if stream_key not in pending_reconnect:
         return  # reconnect already cancelled us
 
-    pending_reconnect.pop(stream_key, None)
+    recon = pending_reconnect.pop(stream_key, {})
+    event_id = recon.get("event_id")
 
     final_stats = await r_stream_end(stream_key)
     duration_s  = int(time.time() - final_stats["started_at"])
@@ -383,6 +384,16 @@ async def _grace_window_expire(stream_key: str) -> None:
         "total_watch_seconds": final_stats["total_watch_seconds"],
         "peak_concurrent":     0,
     })
+
+    # Notify recording server immediately so stream.status webhook fires without
+    # waiting up to 60s for the LiveSync poll cycle.
+    fire("/stream/webhook/stream-ended", {"stream_key": stream_key})
+
+    # Remove event_id → stream_key so /stream-token correctly returns 404 for dead stream.
+    if event_id and redis_client:
+        asyncio.create_task(
+            redis_client.delete(f"{REDIS_PREFIX}event:{event_id}:stream_key")
+        )
 
     log.info(
         f"Grace window expired — session finalised: {stream_key} "
@@ -710,29 +721,59 @@ async def stream_watchdog() -> None:
 
 async def ghost_stream_reconciler() -> None:
     """
-    Runs every 30 seconds.
-    Compares auth in-memory state vs SRS live streams.
-    Removes orphaned entries (OBS dropped without triggering on_unpublish).
+    Runs every 10 seconds.
+    Checks each active stream's client_id directly via GET /api/v1/clients/{client_id}.
+    SRS returns 404 when the client is gone — unambiguous, no stream-name format issues.
+    When a dead client is found, simulates on_unpublish: starts the 30s grace window so
+    OBS can still reconnect as one session within the grace period.
     """
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
         try:
-            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-                resp = await client.get(f"{SRS_API_URL}/api/v1/streams/")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for stream_key, info in list(active_streams.items()):
+                    if stream_key in pending_reconnect:
+                        continue  # grace window already running — on_unpublish fired cleanly
 
-            if not resp.is_success:
-                continue
+                    client_id = info.get("client_id")
+                    if not client_id:
+                        continue
 
-            srs_live    = {s["name"] for s in resp.json().get("streams", [])}
-            auth_active = set(active_streams.keys())
-            ghosts      = auth_active - srs_live
+                    try:
+                        resp = await client.get(f"{SRS_API_URL}/api/v1/clients/{client_id}")
+                    except Exception:
+                        continue  # SRS API unreachable — skip this cycle
 
-            for ghost in ghosts:
-                # on_unpublish already moved this into pending_reconnect — not a ghost
-                if ghost in pending_reconnect:
-                    continue
-                log.warning(f"Ghost stream removed: {ghost} (in auth state but not in SRS)")
-                active_streams.pop(ghost, None)
+                    if resp.status_code != 404:
+                        continue  # client still alive
+
+                    # Client is gone from SRS — simulate on_unpublish so the 30s grace
+                    # window runs (OBS can still reconnect within 30s as one session)
+                    log.warning(
+                        f"Ghost stream auto-cleared: {stream_key} "
+                        f"(client {client_id} not found in SRS)"
+                    )
+                    ghost_info = active_streams.pop(stream_key, {})
+
+                    stats = await r_stream_stats_only(stream_key)
+
+                    video_id = None
+                    if redis_client:
+                        try:
+                            video_id = await redis_client.get(
+                                f"{REDIS_PREFIX}stream:{stream_key}:video_id"
+                            )
+                        except Exception:
+                            pass
+
+                    grace_task = asyncio.create_task(_grace_window_expire(stream_key))
+                    pending_reconnect[stream_key] = {
+                        "video_id":   video_id,
+                        "started_at": stats["started_at"],
+                        "stats":      stats,
+                        "grace_task": grace_task,
+                        "event_id":   ghost_info.get("event_id"),
+                    }
 
         except Exception as e:
             log.warning(f"Reconciler error (non-fatal): {e}")
@@ -897,7 +938,7 @@ async def on_unpublish(request: Request):
     stream_key = body.get("stream", "")
     log.info(f"on_unpublish: stream={stream_key}")
 
-    active_streams.pop(stream_key, {})
+    stream_info = active_streams.pop(stream_key, {})
 
     # Close any still-open viewer sessions in memory (abrupt exits)
     abrupt_exits = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
@@ -922,6 +963,7 @@ async def on_unpublish(request: Request):
         "started_at": stats["started_at"],
         "stats":      stats,
         "grace_task": grace_task,
+        "event_id":   stream_info.get("event_id"),
     }
 
     log.info(
@@ -1169,6 +1211,26 @@ async def convert_and_upload(flv_path: str, stream_key: str):
     except Exception as e:
         log.warning(f"VOD m3u8 generation failed for {stream_key}: {e}")
 
+    # Isolate HLS segments into a per-session subfolder keyed by video_id.
+    # This prevents the stream_key glob in delete_stream_source from wiping
+    # segments that belong to a newer session reusing the same stream_key.
+    if video_id:
+        hls_live = Path(HLS_PATH) / "live"
+        hls_session_dir = hls_live / video_id
+        try:
+            hls_session_dir.mkdir(parents=True, exist_ok=True)
+            moved = 0
+            for f in list(hls_live.glob(f"{stream_key}-*.ts")):
+                f.rename(hls_session_dir / f.name)
+                moved += 1
+            vod_flat = hls_live / f"{stream_key}-vod.m3u8"
+            if vod_flat.exists():
+                vod_flat.rename(hls_session_dir / "vod.m3u8")
+            if moved:
+                log.info(f"HLS segments isolated to {hls_session_dir} ({moved} segments)")
+        except Exception as e:
+            log.warning(f"HLS segment isolation failed (non-fatal): {e}")
+
     # Pop analytics stashed by _grace_window_expire.
     # Grace window expiry sets stream_final_stats; on_dvr fires after on_unpublish so
     # the stats may not be ready yet — wait up to RECONNECT_GRACE_SEC + 5s.
@@ -1255,6 +1317,99 @@ async def upload_to_r2(mp4: Path, stream_key: str) -> Optional[str]:
         log.error(f"R2 upload failed: {e}")
         return None
 
+# ── HLS → MP4 recovery ───────────────────────────────────────────────────────
+
+@app.post("/stream/recover-from-hls")
+async def recover_from_hls(request: Request, _: None = Depends(require_api_key)):
+    """
+    Rebuild a usable MP4 from surviving HLS .ts segments when the DVR MP4 is missing.
+    Called by the recording server's reprocess endpoint for failed zinraistream videos.
+
+    Steps:
+      1. Locate (or regenerate) the vod.m3u8 for stream_key
+      2. ffmpeg convert m3u8 → {video_id}.mp4 in /dvr/live/
+      3. Cache video_id ↔ stream_key in Redis so the worker and cleanup work correctly
+    """
+    body       = await request.json()
+    stream_key = body.get("stream_key", "").strip()
+    video_id   = body.get("video_id", "").strip()
+
+    if not stream_key or not video_id:
+        raise HTTPException(status_code=400, detail="stream_key and video_id are required")
+
+    # Check per-session subfolder first (segments isolated here after a successful session end)
+    hls_live = Path(HLS_PATH) / "live"
+    hls_session_dir = hls_live / video_id
+    if hls_session_dir.exists() and any(hls_session_dir.glob("*.ts")):
+        vod_m3u8 = hls_session_dir / "vod.m3u8"
+        if not vod_m3u8.exists():
+            # Regenerate within the subfolder
+            ts_files = sorted(
+                hls_session_dir.glob("*.ts"),
+                key=lambda f: int(f.stem.rsplit("-", 1)[1]),
+            )
+            lines = [
+                "#EXTM3U", "#EXT-X-VERSION:3",
+                "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-TARGETDURATION:2",
+            ]
+            for ts in ts_files:
+                lines.append("#EXTINF:2.000,")
+                lines.append(ts.name)
+            lines.append("#EXT-X-ENDLIST")
+            vod_m3u8.write_text("\n".join(lines) + "\n")
+        ts_count = len(list(hls_session_dir.glob("*.ts")))
+    else:
+        # Legacy fallback: flat stream_key-*.ts layout (sessions before this fix)
+        vod_m3u8 = hls_live / f"{stream_key}-vod.m3u8"
+        if not vod_m3u8.exists():
+            result = generate_vod_m3u8(stream_key)
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No HLS segments found for stream_key {stream_key} — cannot recover"
+                )
+            vod_m3u8 = result
+        ts_count = len(list(hls_live.glob(f"{stream_key}-*.ts")))
+    log.info(f"HLS recovery: stream={stream_key} video={video_id} segments={ts_count}")
+
+    output_mp4 = Path(DVR_PATH) / "live" / f"{video_id}.mp4"
+    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+    # ffmpeg reads the local m3u8 with file:// segments — no network needed
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,pipe,fd",
+        "-i", str(vod_m3u8),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(output_mp4),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        log.error(f"HLS recovery ffmpeg failed for {stream_key}: {stderr.decode()[-500:]}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg conversion failed: {stderr.decode()[-200:]}"
+        )
+
+    size_mb = output_mp4.stat().st_size // (1024 * 1024)
+    log.info(f"HLS recovery complete: {video_id}.mp4 ({size_mb} MB) from {ts_count} segments")
+
+    # Cache bidirectional mapping so the worker cleanup knows which stream_key to clear
+    if redis_client:
+        try:
+            await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:video_id", video_id, ex=86400)
+            await redis_client.set(f"{REDIS_PREFIX}video:{video_id}:stream_key", stream_key, ex=86400)
+        except Exception as e:
+            log.warning(f"Redis cache failed during recovery: {e}")
+
+    return {"status": "ok", "video_id": video_id, "mp4_size_mb": size_mb, "segments": ts_count}
+
+
 # ── File serving for recordings worker ───────────────────────────────────────
 
 @app.get("/dvr-files/{video_id}")
@@ -1304,13 +1459,26 @@ async def delete_stream_source(video_id: str, request: Request):
     stream_key = None
     if redis_client:
         stream_key = await redis_client.get(f"{REDIS_PREFIX}video:{video_id}:stream_key")
-    if stream_key:
-        # SRS stores files flat: /hls/live/{stream_key}-*.ts — delete all matching files
+    # Delete HLS session folder (segments moved here by convert_and_upload)
+    hls_session_dir = Path(HLS_PATH) / "live" / video_id
+    if hls_session_dir.exists():
+        import shutil as _shutil
+        _shutil.rmtree(hls_session_dir, ignore_errors=True)
+        deleted.append(f"hls/live/{video_id}/")
+    elif stream_key:
+        # Legacy fallback: flat stream_key glob (sessions before the subfolder fix)
         hls_live = Path(HLS_PATH) / "live"
         for f in hls_live.glob(f"{stream_key}*"):
             f.unlink(missing_ok=True)
             deleted.append(f"hls/live/{f.name}")
-        await redis_client.delete(f"{REDIS_PREFIX}video:{video_id}:stream_key", f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        # Only delete stream→video_id mapping if it still points to THIS video.
+        # If a new session started on the same stream_key, the key already holds the
+        # new video_id — deleting it would orphan the new session's DVR assembly.
+        current_vid = await redis_client.get(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        keys_to_del = [f"{REDIS_PREFIX}video:{video_id}:stream_key"]
+        if current_vid == video_id:
+            keys_to_del.append(f"{REDIS_PREFIX}stream:{stream_key}:video_id")
+        await redis_client.delete(*keys_to_del)
 
     log.info(f"Source files deleted for {video_id}: {deleted}")
     return {"deleted": deleted}
@@ -1490,6 +1658,65 @@ def list_streams(_: None = Depends(require_api_key)):
         }
         for k, v in active_streams.items()
     ]
+
+@app.delete("/streams/{stream_key}")
+async def admin_stop_stream(stream_key: str, _: None = Depends(require_api_key)):
+    """
+    Force-clear a live or stuck stream by stream_key.
+    Use when on_unpublish failed to fire (OBS hard-crash, network drop) and the
+    stream shows as live with a black screen, blocking the educator from reconnecting.
+    Clears all in-memory state and Redis keys immediately.
+    """
+    in_active    = stream_key in active_streams
+    in_reconnect = stream_key in pending_reconnect
+
+    if not in_active and not in_reconnect:
+        raise HTTPException(status_code=404, detail=f"Stream '{stream_key}' not found.")
+
+    # Capture state before clearing
+    info      = active_streams.get(stream_key, {})
+    event_id  = info.get("event_id")
+    client_id = info.get("client_id")
+
+    # Kick the SRS RTMP client if still connected
+    if client_id:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.delete(f"{SRS_API_URL}/api/v1/clients/{client_id}")
+        except Exception as e:
+            log.warning(f"SRS kick failed for {stream_key} client={client_id}: {e}")
+
+    # Cancel grace window task if running
+    recon = pending_reconnect.pop(stream_key, None)
+    if recon and recon.get("grace_task"):
+        recon["grace_task"].cancel()
+
+    # Clear all in-memory state
+    active_streams.pop(stream_key, None)
+    session_dvr_pending.pop(stream_key, None)
+    session_dvr_chunks.pop(stream_key, None)
+    stream_final_stats.pop(stream_key, None)
+
+    # Remove stale viewer entries for this stream
+    stale = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
+    for cid in stale:
+        active_viewers.pop(cid, None)
+
+    # Clear Redis state
+    if redis_client:
+        try:
+            await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:status", "ended")
+            if event_id:
+                await redis_client.delete(f"{REDIS_PREFIX}event:{event_id}:stream_key")
+        except Exception as e:
+            log.warning(f"Redis cleanup failed for {stream_key}: {e}")
+
+    log.info(
+        f"Admin force-cleared stream: {stream_key} "
+        f"(was_live={in_active}, in_grace={in_reconnect})"
+    )
+    return {"cleared": True, "stream_key": stream_key, "was_live": in_active or in_reconnect}
+
 
 @app.get("/stats/{stream_key}")
 async def stream_stats(stream_key: str, _: None = Depends(require_api_key)):
