@@ -131,6 +131,10 @@ active_streams: dict[str, dict] = {}   # stream_key → {started_at, client_id, 
 viewer_tokens:  dict[str, dict] = {}   # token → {stream_key, viewer_id, used, expires_at}
 active_viewers: dict[str, dict] = {}   # client_id → {stream_key, viewer_id, token, joined_at, ip_address}
 
+# Temporarily blocked stream keys after admin force-stop.
+# OBS auto-reconnects within seconds; this rejects reconnects until the block expires.
+blocked_stream_keys: dict[str, float] = {}  # stream_key → unblock_timestamp
+
 # FIFO queue of final analytics per stream_key.
 # Keyed by stream_key, each entry is a list so rapid restarts (same key within seconds)
 # don't overwrite each other.  on_unpublish appends; on_dvr/convert_and_upload pops oldest.
@@ -352,14 +356,15 @@ async def _register_video_task(stream_key: str, username: str, educator_id: Opti
         log.error(f"Video registration error for {stream_key}: {e}")
 
 
-async def _grace_window_expire(stream_key: str) -> None:
+async def _grace_window_expire(stream_key: str, delay: int = RECONNECT_GRACE_SEC) -> None:
     """
-    Fires RECONNECT_GRACE_SEC after an on_unpublish.
+    Fires `delay` seconds after an on_unpublish (default: RECONNECT_GRACE_SEC).
     If the publisher hasn't reconnected by then, the session is truly over:
     finalise Redis state, push sessions/end, and kick off chunk assembly if all
     DVR conversions are already done.
+    Pass delay=0 to force-expire immediately (used by admin force-stop on zombie streams).
     """
-    await asyncio.sleep(RECONNECT_GRACE_SEC)
+    await asyncio.sleep(delay)
 
     if stream_key not in pending_reconnect:
         return  # reconnect already cancelled us
@@ -849,6 +854,15 @@ async def on_publish(request: Request):
     app_name   = body.get("app", "live")
 
     log.info(f"on_publish: stream={stream_key} client={client_id}")
+
+    # Reject reconnects while the stream key is admin-blocked (force-stop recovery)
+    unblock_at = blocked_stream_keys.get(stream_key)
+    if unblock_at:
+        if time.time() < unblock_at:
+            log.info(f"on_publish: stream={stream_key} BLOCKED by admin force-stop — rejecting reconnect")
+            return srs_deny("Stream temporarily blocked by admin — please wait before reconnecting")
+        else:
+            blocked_stream_keys.pop(stream_key, None)
 
     # ── Validate stream key against recordings platform ──────────────────────
     if not RECORD_URL or not RECORD_API_KEY:
@@ -1673,48 +1687,35 @@ async def admin_stop_stream(stream_key: str, _: None = Depends(require_api_key))
     if not in_active and not in_reconnect:
         raise HTTPException(status_code=404, detail=f"Stream '{stream_key}' not found.")
 
-    # Capture state before clearing
-    info      = active_streams.get(stream_key, {})
-    event_id  = info.get("event_id")
-    client_id = info.get("client_id")
+    # Block reconnects for 60s so OBS auto-reconnect is rejected at the auth stage
+    blocked_stream_keys[stream_key] = time.time() + 60
 
-    # Kick the SRS RTMP client if still connected
-    if client_id:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.delete(f"{SRS_API_URL}/api/v1/clients/{client_id}")
-        except Exception as e:
-            log.warning(f"SRS kick failed for {stream_key} client={client_id}: {e}")
+    if in_active:
+        # OBS is still streaming — kick it via SRS and let the normal on_unpublish →
+        # grace window → _grace_window_expire flow handle state cleanup and webhooks.
+        # Do NOT pre-clear state here; clearing it before on_unpublish fires would
+        # cancel the grace window and prevent the recording server from being notified.
+        client_id = active_streams.get(stream_key, {}).get("client_id")
+        if client_id:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.delete(f"{SRS_API_URL}/api/v1/clients/{client_id}")
+                log.info(f"Admin kicked SRS client {client_id} for stream {stream_key}")
+            except Exception as e:
+                log.warning(f"SRS kick failed for {stream_key} client={client_id}: {e}")
+        else:
+            log.warning(f"Admin force-stop: no client_id for active stream {stream_key}")
 
-    # Cancel grace window task if running
-    recon = pending_reconnect.pop(stream_key, None)
-    if recon and recon.get("grace_task"):
-        recon["grace_task"].cancel()
+    else:
+        # Stream is in the reconnect grace window (OBS already disconnected but
+        # grace window hasn't expired yet). Cancel the slow timer and force-expire
+        # immediately so the recording server gets notified without waiting 30s.
+        recon = pending_reconnect.get(stream_key, {})
+        if recon.get("grace_task"):
+            recon["grace_task"].cancel()
+        asyncio.create_task(_grace_window_expire(stream_key, delay=0))
 
-    # Clear all in-memory state
-    active_streams.pop(stream_key, None)
-    session_dvr_pending.pop(stream_key, None)
-    session_dvr_chunks.pop(stream_key, None)
-    stream_final_stats.pop(stream_key, None)
-
-    # Remove stale viewer entries for this stream
-    stale = [cid for cid, v in list(active_viewers.items()) if v["stream_key"] == stream_key]
-    for cid in stale:
-        active_viewers.pop(cid, None)
-
-    # Clear Redis state
-    if redis_client:
-        try:
-            await redis_client.set(f"{REDIS_PREFIX}stream:{stream_key}:status", "ended")
-            if event_id:
-                await redis_client.delete(f"{REDIS_PREFIX}event:{event_id}:stream_key")
-        except Exception as e:
-            log.warning(f"Redis cleanup failed for {stream_key}: {e}")
-
-    log.info(
-        f"Admin force-cleared stream: {stream_key} "
-        f"(was_live={in_active}, in_grace={in_reconnect})"
-    )
+    log.info(f"Admin initiated force-stop: {stream_key} (was_live={in_active}, in_grace={in_reconnect}, blocked_for=60s)")
     return {"cleared": True, "stream_key": stream_key, "was_live": in_active or in_reconnect}
 
 
