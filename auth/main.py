@@ -903,7 +903,28 @@ async def on_publish(request: Request):
 
     # ── New session ───────────────────────────────────────────────────────────────
     if stream_key in active_streams:
-        return srs_deny(f"Stream key already in use: {stream_key}")
+        # Verify the existing publisher is still connected in SRS before denying.
+        # If SRS restarted (OOM kill), the client_id returns 404 — treat as fresh publish.
+        existing_client = active_streams[stream_key].get("client_id")
+        client_alive = False
+        if existing_client:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as hc:
+                    r = await hc.get(f"{SRS_API_URL}/api/v1/clients/{existing_client}")
+                    client_alive = (r.status_code == 200)
+            except Exception:
+                pass  # SRS unreachable — treat as dead
+        if client_alive:
+            return srs_deny(f"Stream key already in use: {stream_key}")
+        # Stale entry — SRS restarted. Clear it and allow fresh publish.
+        log.warning(
+            f"on_publish: stale active_streams entry for {stream_key} "
+            f"(client {existing_client} gone from SRS) — clearing for reconnect"
+        )
+        active_streams.pop(stream_key, None)
+        recon = pending_reconnect.pop(stream_key, None)
+        if recon and recon.get("grace_task"):
+            recon["grace_task"].cancel()
 
     if len(active_streams) >= MAX_PUBLISHERS:
         return srs_deny(f"Max publisher limit ({MAX_PUBLISHERS}) reached")
