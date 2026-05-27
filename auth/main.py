@@ -787,39 +787,39 @@ async def ghost_stream_reconciler() -> None:
 
 async def srs_restart_detector() -> None:
     """
-    Polls SRS /api/v1/versions every 5 seconds.
-    SRS assigns a new server_id on every process start.
-    When a change is detected, all active_streams entries are immediately moved
-    into grace windows — same as ghost_stream_reconciler but triggered instantly
-    instead of waiting up to 10 seconds.
+    Polls SRS /api/v1/summaries every 5 seconds and tracks srs_uptime.
+    When uptime drops below the last recorded value, SRS has restarted.
+    All active_streams entries are immediately moved into grace windows so
+    publishers can reconnect without hitting stale-state denials.
     """
-    known_server_id: Optional[str] = None
+    last_uptime: Optional[int] = None
 
     while True:
         await asyncio.sleep(5)
         try:
             async with httpx.AsyncClient(timeout=3.0) as hc:
-                resp = await hc.get(f"{SRS_API_URL}/api/v1/versions")
+                resp = await hc.get(f"{SRS_API_URL}/api/v1/summaries")
                 if resp.status_code != 200:
                     continue
                 data = resp.json()
-                current_id = data.get("data", {}).get("server") or data.get("server_id", "")
-                if not current_id:
+                current_uptime = data.get("data", {}).get("self", {}).get("srs_uptime")
+                if current_uptime is None:
                     continue
 
-                if known_server_id is None:
-                    known_server_id = current_id
+                if last_uptime is None:
+                    last_uptime = current_uptime
                     continue
 
-                if current_id == known_server_id:
+                if current_uptime >= last_uptime:
+                    last_uptime = current_uptime
                     continue
 
-                # server_id changed — SRS restarted
+                # uptime went backwards — SRS restarted
                 log.warning(
-                    f"SRS restart detected: server_id changed "
-                    f"{known_server_id} → {current_id} — clearing all active streams"
+                    f"SRS restart detected: uptime dropped {last_uptime}s → {current_uptime}s "
+                    f"— clearing all active streams"
                 )
-                known_server_id = current_id
+                last_uptime = current_uptime
 
                 for stream_key, info in list(active_streams.items()):
                     if stream_key in pending_reconnect:
