@@ -644,6 +644,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(stream_watchdog()),
         asyncio.create_task(ghost_stream_reconciler()),
         asyncio.create_task(dvr_disk_guard()),
+        asyncio.create_task(srs_restart_detector()),
     ]
 
     yield
@@ -784,6 +785,76 @@ async def ghost_stream_reconciler() -> None:
             log.warning(f"Reconciler error (non-fatal): {e}")
 
 
+async def srs_restart_detector() -> None:
+    """
+    Polls SRS /api/v1/versions every 5 seconds.
+    SRS assigns a new server_id on every process start.
+    When a change is detected, all active_streams entries are immediately moved
+    into grace windows — same as ghost_stream_reconciler but triggered instantly
+    instead of waiting up to 10 seconds.
+    """
+    known_server_id: Optional[str] = None
+
+    while True:
+        await asyncio.sleep(5)
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as hc:
+                resp = await hc.get(f"{SRS_API_URL}/api/v1/versions")
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                current_id = data.get("data", {}).get("server") or data.get("server_id", "")
+                if not current_id:
+                    continue
+
+                if known_server_id is None:
+                    known_server_id = current_id
+                    continue
+
+                if current_id == known_server_id:
+                    continue
+
+                # server_id changed — SRS restarted
+                log.warning(
+                    f"SRS restart detected: server_id changed "
+                    f"{known_server_id} → {current_id} — clearing all active streams"
+                )
+                known_server_id = current_id
+
+                for stream_key, info in list(active_streams.items()):
+                    if stream_key in pending_reconnect:
+                        continue  # grace window already running
+
+                    client_id = info.get("client_id")
+                    log.warning(
+                        f"SRS restart: starting grace window for {stream_key} "
+                        f"(client {client_id})"
+                    )
+                    ghost_info = active_streams.pop(stream_key, {})
+
+                    stats = await r_stream_stats_only(stream_key)
+                    video_id = None
+                    if redis_client:
+                        try:
+                            video_id = await redis_client.get(
+                                f"{REDIS_PREFIX}stream:{stream_key}:video_id"
+                            )
+                        except Exception:
+                            pass
+
+                    grace_task = asyncio.create_task(_grace_window_expire(stream_key))
+                    pending_reconnect[stream_key] = {
+                        "video_id":   video_id,
+                        "started_at": stats["started_at"],
+                        "stats":      stats,
+                        "grace_task": grace_task,
+                        "event_id":   ghost_info.get("event_id"),
+                    }
+
+        except Exception as e:
+            log.debug(f"SRS restart detector (non-fatal): {e}")
+
+
 async def dvr_disk_guard() -> None:
     """
     Runs every 5 minutes.
@@ -903,8 +974,6 @@ async def on_publish(request: Request):
 
     # ── New session ───────────────────────────────────────────────────────────────
     if stream_key in active_streams:
-        # Verify the existing publisher is still connected in SRS before denying.
-        # If SRS restarted (OOM kill), the client_id returns 404 — treat as fresh publish.
         existing_client = active_streams[stream_key].get("client_id")
         client_alive = False
         if existing_client:
@@ -915,12 +984,23 @@ async def on_publish(request: Request):
             except Exception:
                 pass  # SRS unreachable — treat as dead
         if client_alive:
-            return srs_deny(f"Stream key already in use: {stream_key}")
-        # Stale entry — SRS restarted. Clear it and allow fresh publish.
-        log.warning(
-            f"on_publish: stale active_streams entry for {stream_key} "
-            f"(client {existing_client} gone from SRS) — clearing for reconnect"
-        )
+            # Kick the old publisher so the new one can take over seamlessly.
+            # SRS will fire on_unpublish for the old client → grace window → session ends.
+            # Viewers stay connected to the same stream path and receive the new feed automatically.
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as hc:
+                    await hc.delete(f"{SRS_API_URL}/api/v1/clients/{existing_client}")
+            except Exception:
+                pass
+            log.warning(
+                f"on_publish: kicked old client {existing_client} for {stream_key} "
+                f"— new publish taking over"
+            )
+        else:
+            log.warning(
+                f"on_publish: stale entry for {stream_key} "
+                f"(client {existing_client} gone from SRS) — clearing for reconnect"
+            )
         active_streams.pop(stream_key, None)
         recon = pending_reconnect.pop(stream_key, None)
         if recon and recon.get("grace_task"):
