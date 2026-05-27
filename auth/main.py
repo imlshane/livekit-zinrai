@@ -1102,10 +1102,8 @@ async def on_play(request: Request):
 
     log.info(f"on_play: stream={stream_key} param={param} client={client_id}")
 
-    # Parse token and browser session id from query string
     qs    = urllib.parse.parse_qs(param.lstrip("?"))
     token = qs.get("token", [None])[0]
-    sid   = qs.get("sid",   [None])[0]
 
     if not token:
         return srs_deny("Missing viewer token")
@@ -1129,16 +1127,12 @@ async def on_play(request: Request):
         if ip_address != bound_ip:
             log.warning(f"on_play DENIED: token reuse from different IP {ip_address} (bound to {bound_ip})")
             return srs_deny("Token already claimed by another viewer")
-        if sid and bound_sid and sid != bound_sid:
-            log.warning(f"on_play DENIED: token reuse from different session {sid} (bound to {bound_sid})")
-            return srs_deny("Token already claimed by another session")
         is_reconnect = True
     else:
         # First use — bind token to this IP and browser session
         entry["used"]      = True
         entry["used_at"]   = time.time()
         entry["bound_ip"]  = ip_address
-        entry["bound_sid"] = sid
 
     viewer_id    = entry.get("viewer_id") or f"anon-{client_id}"
     is_anonymous = not bool(entry.get("viewer_id"))
