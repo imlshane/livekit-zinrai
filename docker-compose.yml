@@ -1,7 +1,7 @@
 services:
 
   srs:
-    image: ossrs/srs:5
+    image: ossrs/srs:v6
     container_name: srs-origin
     restart: unless-stopped
     command: ./objs/srs -c conf/srs.conf
