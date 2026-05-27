@@ -13,7 +13,7 @@ log "Smart restart triggered — checking for active streams..."
 
 for i in $(seq 1 $attempts); do
     stream_count=$(curl -sf http://localhost:1985/api/v1/streams/ \
-        | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('streams', [])))" 2>/dev/null)
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for s in d.get('streams',[]) if s.get('publish',{}).get('active',False)))" 2>/dev/null)
 
     if [ -z "$stream_count" ]; then
         log "WARNING: Could not reach SRS API — skipping restart (attempt $i/$attempts)"
