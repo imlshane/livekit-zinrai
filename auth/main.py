@@ -138,11 +138,15 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
             log.info(f"Sticky cleared for {sid[:8]} — node lost stream")
 
     # 2 — prefer warm nodes (forward established)
+    # Advance the round-robin index ONCE per viewer so each new viewer starts
+    # their search at a different node, giving true distribution across nodes.
     warm_node: str | None = None
     any_node: str | None = None
+    start_idx = _srs_node_index
+    _srs_node_index += 1  # one advance per viewer call
 
-    for _ in range(len(_srs_nodes)):
-        node = _next_srs_node()
+    for offset in range(len(_srs_nodes)):
+        node = _srs_nodes[(start_idx + offset) % len(_srs_nodes)]
         try:
             async with httpx.AsyncClient(timeout=1.5) as hc:
                 r = await hc.get(f"{node}/api/v1/streams/")
