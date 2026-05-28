@@ -49,6 +49,7 @@ services:
       - MANAGEMENT_API_KEY=${MANAGEMENT_API_KEY:-}
       - VIEWER_TOKEN_API_KEY=${VIEWER_TOKEN_API_KEY:-}
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
+      - SRS_NODES=http://srs:1985,http://srs-edge1:1985,http://srs-edge2:1985
     ulimits:
       nofile:
         soft: 100000

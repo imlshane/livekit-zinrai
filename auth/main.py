@@ -51,7 +51,19 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 # Recordings platform — push stream events in real-time
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
-SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
+SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API (origin)
+
+# Round-robin across origin + edge nodes for /play signaling.
+# SRS_NODES is a comma-separated list of internal HTTP API URLs.
+# Defaults to origin-only; add edge URLs when edges are deployed.
+_srs_nodes = [u.strip() for u in os.environ.get("SRS_NODES", SRS_API_URL).split(",") if u.strip()]
+_srs_node_index = 0
+
+def _next_srs_node() -> str:
+    global _srs_node_index
+    node = _srs_nodes[_srs_node_index % len(_srs_nodes)]
+    _srs_node_index += 1
+    return node
 REDIS_URL            = os.environ.get("REDIS_URL", "")
 REDIS_PREFIX         = os.environ.get("REDIS_PREFIX", "zinrai:live:")
 MANAGEMENT_API_KEY   = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
@@ -1655,17 +1667,18 @@ async def webrtc_play(body: PlayRequest, request: Request):
     srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
     stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
 
-    log.info(f"WebRTC proxy: calling SRS {SRS_API_URL}/rtc/v1/play/ streamurl={stream_url}")
+    srs_node = _next_srs_node()
+    log.info(f"WebRTC proxy: calling SRS {srs_node}/rtc/v1/play/ streamurl={stream_url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{SRS_API_URL}/rtc/v1/play/",
+                f"{srs_node}/rtc/v1/play/",
                 json={"sdp": body.sdp, "streamurl": stream_url},
             )
         result = resp.json()
-        log.info(f"SRS /rtc/v1/play/ response: http={resp.status_code} code={result.get('code')} data={result.get('data', '')}")
+        log.info(f"SRS /rtc/v1/play/ response: node={srs_node} http={resp.status_code} code={result.get('code')} data={result.get('data', '')}")
     except Exception as e:
-        log.error(f"SRS /rtc/v1/play/ proxy error: {e}")
+        log.error(f"SRS /rtc/v1/play/ proxy error: node={srs_node} {e}")
         raise HTTPException(status_code=502, detail="Stream server unreachable.")
 
     if result.get("code") == 401 or result.get("code") == 403:
