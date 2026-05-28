@@ -140,6 +140,7 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
     # 2 — prefer warm nodes (forward established)
     # Advance the round-robin index ONCE per viewer so each new viewer starts
     # their search at a different node, giving true distribution across nodes.
+    global _srs_node_index
     warm_node: str | None = None
     any_node: str | None = None
     start_idx = _srs_node_index
