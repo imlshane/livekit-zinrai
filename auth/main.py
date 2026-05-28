@@ -65,28 +65,6 @@ def _next_srs_node() -> str:
     _srs_node_index += 1
     return node
 
-# ── Sticky sessions ────────────────────────────────────────────────────────────
-# Maps sid → (node_url, expires_at). Keeps a viewer on the same SRS node across
-# reconnects so they don't cycle through nodes and produce DTLS_HANG on edges.
-_sticky_sessions: dict[str, tuple[str, float]] = {}
-
-def _sticky_set(sid: str, node: str) -> None:
-    _sticky_sessions[sid] = (node, time.time() + TOKEN_TTL)
-
-def _sticky_get(sid: str) -> str | None:
-    entry = _sticky_sessions.get(sid)
-    if entry and entry[1] > time.time():
-        return entry[0]
-    _sticky_sessions.pop(sid, None)
-    return None
-
-def _sticky_clear(sid: str) -> None:
-    _sticky_sessions.pop(sid, None)
-
-def _prune_sticky_sessions() -> None:
-    now = time.time()
-    for sid in [s for s, (_, exp) in list(_sticky_sessions.items()) if exp < now]:
-        _sticky_sessions.pop(sid, None)
 
 # ── Forward health ─────────────────────────────────────────────────────────────
 # Tracks when we first saw a stream active on each node. Edge nodes with a fresh
@@ -116,41 +94,18 @@ def _node_stream_reset(node: str, stream_key: str) -> None:
     _node_stream_first_seen.pop(f"{node}:{stream_key}", None)
 
 
-async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
+async def _pick_node_for_stream(stream_key: str) -> str:
     """Return a healthy SRS node for the given stream.
 
-    1. If the viewer's sid has a sticky node that still has the stream → reuse it.
-    2. Otherwise round-robin across nodes, preferring warm ones (forward established ≥5s).
-    3. Fall back to any node with an active stream, then to origin.
+    Round-robin across nodes, preferring warm ones (forward established).
+    No sticky — every connect/reconnect gets a fresh assignment.
+    If a viewer has issues they reload and naturally land on a different node.
     """
-    _prune_sticky_sessions()
-
-    # 1 — sticky session
-    if sid:
-        sticky = _sticky_get(sid)
-        if sticky:
-            try:
-                async with httpx.AsyncClient(timeout=1.5) as hc:
-                    r = await hc.get(f"{sticky}/api/v1/streams/")
-                if r.is_success:
-                    for s in r.json().get("streams", []):
-                        if s.get("name") == stream_key and s.get("publish", {}).get("active"):
-                            log.info(f"Sticky: {sid[:8]} → {sticky}")
-                            _node_stream_seen(sticky, stream_key)
-                            return sticky
-            except Exception:
-                pass
-            _sticky_clear(sid)
-            log.info(f"Sticky cleared for {sid[:8]} — node lost stream")
-
-    # 2 — prefer warm nodes (forward established)
-    # Advance the round-robin index ONCE per viewer so each new viewer starts
-    # their search at a different node, giving true distribution across nodes.
     global _srs_node_index
     warm_node: str | None = None
-    any_node: str | None = None
+    any_node:  str | None = None
     start_idx = _srs_node_index
-    _srs_node_index += 1  # one advance per viewer call
+    _srs_node_index += 1  # one advance per viewer call — true round-robin distribution
 
     for offset in range(len(_srs_nodes)):
         node = _srs_nodes[(start_idx + offset) % len(_srs_nodes)]
@@ -161,7 +116,6 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
                 continue
             for s in r.json().get("streams", []):
                 if s.get("name") == stream_key and s.get("publish", {}).get("active"):
-                    # was_reset=True if the node had a recent drop — restarts warmup timer
                     was_reset = f"{node}:{stream_key}" not in _node_stream_first_seen
                     _node_stream_seen(node, stream_key, was_reset=was_reset)
                     if any_node is None:
@@ -172,9 +126,7 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
             _node_stream_reset(node, stream_key)
 
     chosen = warm_node or any_node or SRS_API_URL
-    if sid:
-        _sticky_set(sid, chosen)
-        log.info(f"Sticky set: {sid[:8]} → {chosen} (warm={warm_node is not None})")
+    log.info(f"Node picked: {chosen} (warm={warm_node is not None})")
     return chosen
 REDIS_URL            = os.environ.get("REDIS_URL", "")
 REDIS_PREFIX         = os.environ.get("REDIS_PREFIX", "zinrai:live:")
@@ -1779,7 +1731,7 @@ async def webrtc_play(body: PlayRequest, request: Request):
     srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
     stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
 
-    srs_node = await _pick_node_for_stream(stream_key, sid)
+    srs_node = await _pick_node_for_stream(stream_key)
     log.info(f"WebRTC proxy: calling SRS {srs_node}/rtc/v1/play/ streamurl={stream_url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
