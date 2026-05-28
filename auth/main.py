@@ -91,23 +91,26 @@ def _prune_sticky_sessions() -> None:
 # ── Forward health ─────────────────────────────────────────────────────────────
 # Tracks when we first saw a stream active on each node. Edge nodes with a fresh
 # RTMP forward (just reconnected) may have recv_bytes=0 — skip them until warm.
-_node_stream_first_seen: dict[str, float] = {}  # "node:stream_key" → timestamp
-_FORWARD_WARMUP_SEC = 30.0  # forward needs ~20s to stabilize after reconnect
+_node_stream_first_seen: dict[str, tuple[float, bool]] = {}  # "node:stream_key" → (timestamp, was_drop)
+_WARMUP_NEW_STREAM_SEC  = 5.0   # forward establishes in 1-2s on fresh stream start
+_WARMUP_AFTER_DROP_SEC  = 30.0  # forward just reconnected after a drop — needs longer to stabilise
 
 def _node_is_warm(node: str, stream_key: str) -> bool:
     key = f"{node}:{stream_key}"
     now = time.time()
     if key not in _node_stream_first_seen:
-        _node_stream_first_seen[key] = now
+        _node_stream_first_seen[key] = (now, False)
         return False
-    return (now - _node_stream_first_seen[key]) >= _FORWARD_WARMUP_SEC
+    first_seen, was_drop = _node_stream_first_seen[key]
+    threshold = _WARMUP_AFTER_DROP_SEC if was_drop else _WARMUP_NEW_STREAM_SEC
+    return (now - first_seen) >= threshold
 
 def _node_stream_seen(node: str, stream_key: str, was_reset: bool = False) -> None:
     key = f"{node}:{stream_key}"
     if was_reset:
-        _node_stream_first_seen[key] = time.time()  # restart warmup after drop
+        _node_stream_first_seen[key] = (time.time(), True)   # drop → long warmup
     else:
-        _node_stream_first_seen.setdefault(key, time.time())
+        _node_stream_first_seen.setdefault(key, (time.time(), False))  # new → short warmup
 
 def _node_stream_reset(node: str, stream_key: str) -> None:
     _node_stream_first_seen.pop(f"{node}:{stream_key}", None)
