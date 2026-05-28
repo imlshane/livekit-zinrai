@@ -64,6 +64,21 @@ def _next_srs_node() -> str:
     node = _srs_nodes[_srs_node_index % len(_srs_nodes)]
     _srs_node_index += 1
     return node
+
+async def _pick_node_for_stream(stream_key: str) -> str:
+    """Return a node that has the stream active. Falls back to origin if none ready."""
+    for _ in range(len(_srs_nodes)):
+        node = _next_srs_node()
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as hc:
+                r = await hc.get(f"{node}/api/v1/streams/")
+            if r.is_success:
+                for s in r.json().get("streams", []):
+                    if s.get("name") == stream_key and s.get("publish", {}).get("active"):
+                        return node
+        except Exception:
+            pass
+    return SRS_API_URL  # all nodes checked — fall back to origin
 REDIS_URL            = os.environ.get("REDIS_URL", "")
 REDIS_PREFIX         = os.environ.get("REDIS_PREFIX", "zinrai:live:")
 MANAGEMENT_API_KEY   = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
@@ -1667,7 +1682,7 @@ async def webrtc_play(body: PlayRequest, request: Request):
     srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
     stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
 
-    srs_node = _next_srs_node()
+    srs_node = await _pick_node_for_stream(stream_key)
     log.info(f"WebRTC proxy: calling SRS {srs_node}/rtc/v1/play/ streamurl={stream_url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
