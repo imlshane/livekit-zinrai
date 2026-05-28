@@ -1,7 +1,7 @@
 services:
 
   srs:
-    image: ossrs/srs:5
+    image: ossrs/srs:v6
     container_name: srs-origin
     restart: unless-stopped
     command: ./objs/srs -c conf/srs.conf
@@ -14,10 +14,10 @@ services:
       - "8000:8000/udp"              # WebRTC media (SRTP) — must be public
     ulimits:
       nofile:
-        soft: 65535
-        hard: 65535
-    mem_limit: 3g
-    memswap_limit: 3g
+        soft: 100000
+        hard: 100000
+    mem_limit: 8g
+    memswap_limit: 8g
     volumes:
       - ./srs/origin.conf:/usr/local/srs/conf/srs.conf
       - ./srs/logs:/usr/local/srs/logs
@@ -51,10 +51,10 @@ services:
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
     ulimits:
       nofile:
-        soft: 65535
-        hard: 65535
-    mem_limit: 512m
-    memswap_limit: 512m
+        soft: 100000
+        hard: 100000
+    mem_limit: 4g
+    memswap_limit: 4g
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
       interval: 15s
@@ -73,10 +73,10 @@ services:
     restart: unless-stopped
     ulimits:
       nofile:
-        soft: 65535
-        hard: 65535
-    mem_limit: 256m
-    memswap_limit: 256m
+        soft: 100000
+        hard: 100000
+    mem_limit: 512m
+    memswap_limit: 512m
     ports:
       - "80:80"
       - "443:443"
