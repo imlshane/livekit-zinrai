@@ -92,7 +92,7 @@ def _prune_sticky_sessions() -> None:
 # Tracks when we first saw a stream active on each node. Edge nodes with a fresh
 # RTMP forward (just reconnected) may have recv_bytes=0 — skip them until warm.
 _node_stream_first_seen: dict[str, float] = {}  # "node:stream_key" → timestamp
-_FORWARD_WARMUP_SEC = 5.0
+_FORWARD_WARMUP_SEC = 30.0  # forward needs ~20s to stabilize after reconnect
 
 def _node_is_warm(node: str, stream_key: str) -> bool:
     key = f"{node}:{stream_key}"
@@ -102,9 +102,12 @@ def _node_is_warm(node: str, stream_key: str) -> bool:
         return False
     return (now - _node_stream_first_seen[key]) >= _FORWARD_WARMUP_SEC
 
-def _node_stream_seen(node: str, stream_key: str) -> None:
+def _node_stream_seen(node: str, stream_key: str, was_reset: bool = False) -> None:
     key = f"{node}:{stream_key}"
-    _node_stream_first_seen.setdefault(key, time.time())
+    if was_reset:
+        _node_stream_first_seen[key] = time.time()  # restart warmup after drop
+    else:
+        _node_stream_first_seen.setdefault(key, time.time())
 
 def _node_stream_reset(node: str, stream_key: str) -> None:
     _node_stream_first_seen.pop(f"{node}:{stream_key}", None)
@@ -155,7 +158,9 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
                 continue
             for s in r.json().get("streams", []):
                 if s.get("name") == stream_key and s.get("publish", {}).get("active"):
-                    _node_stream_seen(node, stream_key)
+                    # was_reset=True if the node had a recent drop — restarts warmup timer
+                    was_reset = f"{node}:{stream_key}" not in _node_stream_first_seen
+                    _node_stream_seen(node, stream_key, was_reset=was_reset)
                     if any_node is None:
                         any_node = node
                     if warm_node is None and _node_is_warm(node, stream_key):
