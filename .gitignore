@@ -1,5 +1,6 @@
 # Environment — copy .env.example and fill in real values
 .env
+.env.*.local
 
 # SQLite database (created at runtime)
 *.db
