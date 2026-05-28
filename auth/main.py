@@ -159,7 +159,7 @@ async def _pick_node_for_stream(stream_key: str, sid: str | None = None) -> str:
             _node_stream_reset(node, stream_key)
 
     chosen = warm_node or any_node or SRS_API_URL
-    if sid and chosen != SRS_API_URL:
+    if sid:
         _sticky_set(sid, chosen)
         log.info(f"Sticky set: {sid[:8]} → {chosen} (warm={warm_node is not None})")
     return chosen
