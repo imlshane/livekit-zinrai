@@ -1,0 +1,31 @@
+# Edge SRS node — deploy this file on each edge droplet at /opt/livekit/
+# Required .env vars on the edge server:
+#   CANDIDATE         — edge server public IP (WebRTC ICE candidate)
+#   ORIGIN_PRIVATE_IP — origin server private/VPC IP (RTMP pull source)
+#   SRS_PUBLIC_HOST   — public domain, e.g. devlivestream.zinrai.live (for auth callbacks)
+#   EDGE_PRIVATE_IP   — edge server private/VPC IP (binds HTTP API for Caddy)
+
+services:
+
+  srs:
+    image: ossrs/srs:v6
+    container_name: srs-edge
+    restart: unless-stopped
+    command: ./objs/srs -c conf/srs.conf
+    environment:
+      - CANDIDATE=${CANDIDATE}
+      - ORIGIN_PRIVATE_IP=${ORIGIN_PRIVATE_IP}
+      - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST}
+    ports:
+      - "1935:1935"                              # RTMP pull from origin — must be reachable by origin
+      - "8000:8000/udp"                          # WebRTC SRTP — must be public
+      - "${EDGE_PRIVATE_IP}:1985:1985"           # HTTP API — private IP only, accessed by origin Caddy
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    mem_limit: 4g
+    memswap_limit: 4g
+    volumes:
+      - ./srs/edge.conf:/usr/local/srs/conf/srs.conf
+      - ./srs/logs:/usr/local/srs/logs

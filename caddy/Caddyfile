@@ -22,6 +22,9 @@
     }
 
     # ── WebRTC signaling → SRS HTTP API (port 1985) ──────────────────────────
+    # Round-robin across origin + edges. Safe for WebRTC: each SRS instance
+    # returns its own ICE candidates (IP:port), so the browser's SRTP connects
+    # directly to whichever instance handled the signaling.
     handle /rtc/v1/* {
         @preflight method OPTIONS
         respond @preflight 204
@@ -31,7 +34,13 @@
         header Access-Control-Allow-Headers "Content-Type"
         header Vary                         Origin
 
-        reverse_proxy srs:1985
+        reverse_proxy srs:1985 srs-edge1:1985 srs-edge2:1985 {
+            lb_policy       round_robin
+            health_uri      /api/v1/summaries
+            health_interval 10s
+            health_timeout  5s
+            health_status   200
+        }
     }
 
     # ── HLS fallback → SRS HTTP server (port 8080) ──────────────────────────

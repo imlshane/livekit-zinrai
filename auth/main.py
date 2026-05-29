@@ -51,7 +51,83 @@ S3_SECRET    = os.environ.get("S3_SECRET_KEY", "")
 # Recordings platform — push stream events in real-time
 RECORD_URL     = os.environ.get("RECORD_URL", "").rstrip("/")      # e.g. https://devstreamapp.zinrai.live
 RECORD_API_KEY = os.environ.get("RECORD_API_KEY", "")              # x-api-key header value
-SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API
+SRS_API_URL    = os.environ.get("SRS_API_URL", "http://srs:1985")  # SRS internal HTTP API (origin)
+
+# Round-robin across origin + edge nodes for /play signaling.
+# SRS_NODES is a comma-separated list of internal HTTP API URLs.
+# Defaults to origin-only; add edge URLs when edges are deployed.
+_srs_nodes = [u.strip() for u in os.environ.get("SRS_NODES", SRS_API_URL).split(",") if u.strip()]
+_srs_node_index = 0
+
+def _next_srs_node() -> str:
+    global _srs_node_index
+    node = _srs_nodes[_srs_node_index % len(_srs_nodes)]
+    _srs_node_index += 1
+    return node
+
+
+# ── Forward health ─────────────────────────────────────────────────────────────
+# Tracks when we first saw a stream active on each node. Edge nodes with a fresh
+# RTMP forward (just reconnected) may have recv_bytes=0 — skip them until warm.
+_node_stream_first_seen: dict[str, tuple[float, bool]] = {}  # "node:stream_key" → (timestamp, was_drop)
+_WARMUP_NEW_STREAM_SEC  = 5.0   # forward establishes in 1-2s on fresh stream start
+_WARMUP_AFTER_DROP_SEC  = 30.0  # forward just reconnected after a drop — needs longer to stabilise
+
+def _node_is_warm(node: str, stream_key: str) -> bool:
+    key = f"{node}:{stream_key}"
+    now = time.time()
+    if key not in _node_stream_first_seen:
+        _node_stream_first_seen[key] = (now, False)
+        return False
+    first_seen, was_drop = _node_stream_first_seen[key]
+    threshold = _WARMUP_AFTER_DROP_SEC if was_drop else _WARMUP_NEW_STREAM_SEC
+    return (now - first_seen) >= threshold
+
+def _node_stream_seen(node: str, stream_key: str, was_reset: bool = False) -> None:
+    key = f"{node}:{stream_key}"
+    if was_reset:
+        _node_stream_first_seen[key] = (time.time(), True)   # drop → long warmup
+    else:
+        _node_stream_first_seen.setdefault(key, (time.time(), False))  # new → short warmup
+
+def _node_stream_reset(node: str, stream_key: str) -> None:
+    _node_stream_first_seen.pop(f"{node}:{stream_key}", None)
+
+
+async def _pick_node_for_stream(stream_key: str) -> str:
+    """Return a healthy SRS node for the given stream.
+
+    Round-robin across nodes, preferring warm ones (forward established).
+    No sticky — every connect/reconnect gets a fresh assignment.
+    If a viewer has issues they reload and naturally land on a different node.
+    """
+    global _srs_node_index
+    warm_node: str | None = None
+    any_node:  str | None = None
+    start_idx = _srs_node_index
+    _srs_node_index += 1  # one advance per viewer call — true round-robin distribution
+
+    for offset in range(len(_srs_nodes)):
+        node = _srs_nodes[(start_idx + offset) % len(_srs_nodes)]
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as hc:
+                r = await hc.get(f"{node}/api/v1/streams/")
+            if not r.is_success:
+                continue
+            for s in r.json().get("streams", []):
+                if s.get("name") == stream_key and s.get("publish", {}).get("active"):
+                    was_reset = f"{node}:{stream_key}" not in _node_stream_first_seen
+                    _node_stream_seen(node, stream_key, was_reset=was_reset)
+                    if any_node is None:
+                        any_node = node
+                    if warm_node is None and _node_is_warm(node, stream_key):
+                        warm_node = node
+        except Exception:
+            _node_stream_reset(node, stream_key)
+
+    chosen = warm_node or any_node or SRS_API_URL
+    log.info(f"Node picked: {chosen} (warm={warm_node is not None})")
+    return chosen
 REDIS_URL            = os.environ.get("REDIS_URL", "")
 REDIS_PREFIX         = os.environ.get("REDIS_PREFIX", "zinrai:live:")
 MANAGEMENT_API_KEY   = os.environ.get("MANAGEMENT_API_KEY", "")   # recording server + internal ops
@@ -1655,17 +1731,18 @@ async def webrtc_play(body: PlayRequest, request: Request):
     srs_host = os.environ.get("SRS_PUBLIC_HOST", "livestream.zinrai.live")
     stream_url = f"webrtc://{srs_host}/live/{stream_key}?token={body.token}&sid={sid}"
 
-    log.info(f"WebRTC proxy: calling SRS {SRS_API_URL}/rtc/v1/play/ streamurl={stream_url}")
+    srs_node = await _pick_node_for_stream(stream_key)
+    log.info(f"WebRTC proxy: calling SRS {srs_node}/rtc/v1/play/ streamurl={stream_url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{SRS_API_URL}/rtc/v1/play/",
+                f"{srs_node}/rtc/v1/play/",
                 json={"sdp": body.sdp, "streamurl": stream_url},
             )
         result = resp.json()
-        log.info(f"SRS /rtc/v1/play/ response: http={resp.status_code} code={result.get('code')} data={result.get('data', '')}")
+        log.info(f"SRS /rtc/v1/play/ response: node={srs_node} http={resp.status_code} code={result.get('code')} data={result.get('data', '')}")
     except Exception as e:
-        log.error(f"SRS /rtc/v1/play/ proxy error: {e}")
+        log.error(f"SRS /rtc/v1/play/ proxy error: node={srs_node} {e}")
         raise HTTPException(status_code=502, detail="Stream server unreachable.")
 
     if result.get("code") == 401 or result.get("code") == 403:
