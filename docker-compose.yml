@@ -49,7 +49,7 @@ services:
       - MANAGEMENT_API_KEY=${MANAGEMENT_API_KEY:-}
       - VIEWER_TOKEN_API_KEY=${VIEWER_TOKEN_API_KEY:-}
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
-      - SRS_NODES=http://srs:1985,http://srs-edge1:1985,http://srs-edge2:1985
+      - SRS_NODES=http://srs:1985,http://srs-edge1:1985,http://srs-edge2:1985,http://srs-edge3:1985
     ulimits:
       nofile:
         soft: 100000
@@ -110,6 +110,28 @@ services:
     memswap_limit: 4g
     volumes:
       - ./srs/edge2.conf:/usr/local/srs/conf/srs.conf
+      - ./srs/logs:/usr/local/srs/logs
+    depends_on:
+      - srs
+
+  srs-edge3:
+    image: ossrs/srs:v6
+    container_name: srs-edge3
+    restart: unless-stopped
+    command: ./objs/srs -c conf/srs.conf
+    environment:
+      - CANDIDATE=${SERVER_IP}
+      - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
+    ports:
+      - "8003:8003/udp"              # WebRTC SRTP — public, browser connects server-ip:8003
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    mem_limit: 4g
+    memswap_limit: 4g
+    volumes:
+      - ./srs/edge3.conf:/usr/local/srs/conf/srs.conf
       - ./srs/logs:/usr/local/srs/logs
     depends_on:
       - srs
