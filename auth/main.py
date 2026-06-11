@@ -667,6 +667,7 @@ async def restore_active_streams() -> None:
                 }
                 log.info(f"♻️  Restored stream: {stream_key} by {publisher.username} (client={client_id})")
                 restored += 1
+                subtitle_start(stream_key)
         finally:
             db.close()
 
