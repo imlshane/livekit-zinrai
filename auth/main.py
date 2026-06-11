@@ -741,7 +741,7 @@ async def _run_transcription(stream_key: str) -> None:
             targets=[],
         )
         log.info(f"Subtitle transcription started: {stream_key} lang={PALABRA_SOURCE_LANG}")
-        await palabra.arun(cfg)
+        await asyncio.to_thread(palabra.run, cfg)
     except asyncio.CancelledError:
         log.info(f"Subtitle transcription cancelled: {stream_key}")
     except Exception as e:
