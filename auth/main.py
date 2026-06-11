@@ -32,7 +32,7 @@ from typing import Optional
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -139,6 +139,10 @@ STREAM_WARN_BEFORE_SEC  = 600    # warn 10 minutes before hard stop
 TOKEN_TTL               = 7200   # seconds — matches 2h max stream duration
 RECONNECT_GRACE_SEC     = int(os.environ.get("RECONNECT_GRACE_SEC", "30"))  # window to treat a reconnect as session resume
 
+PALABRA_CLIENT_ID     = os.environ.get("PALABRA_CLIENT_ID", "")
+PALABRA_CLIENT_SECRET = os.environ.get("PALABRA_CLIENT_SECRET", "")
+PALABRA_SOURCE_LANG   = os.environ.get("PALABRA_SOURCE_LANG", "en")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -223,6 +227,11 @@ pending_reconnect: dict[str, dict] = {}
 # DVR chunk coordination — tracks converted MP4 parts for sessions with mid-stream drops.
 session_dvr_chunks:  dict[str, list] = {}  # stream_key → [Path, ...]
 session_dvr_pending: dict[str, int]  = {}  # stream_key → outstanding FLV conversions
+
+# Subtitle state — per-stream SSE subscriber queues and Palabra transcription tasks.
+# Each viewer SSE connection gets its own asyncio.Queue; None is the end sentinel.
+_subtitle_queues: dict[str, list] = {}         # stream_key → [asyncio.Queue, ...]
+_subtitle_tasks:  dict[str, asyncio.Task] = {}  # stream_key → running _run_transcription task
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 
@@ -448,6 +457,8 @@ async def _grace_window_expire(stream_key: str, delay: int = RECONNECT_GRACE_SEC
     recon = pending_reconnect.pop(stream_key, {})
     event_id = recon.get("event_id")
 
+    subtitle_stop(stream_key)
+
     final_stats = await r_stream_end(stream_key)
     duration_s  = int(time.time() - final_stats["started_at"])
 
@@ -666,6 +677,93 @@ async def restore_active_streams() -> None:
 
     except Exception as e:
         log.warning(f"⚠️  State recovery failed (non-fatal): {e}")
+
+
+# ── Subtitles (Palabra.ai speech-to-text) ─────────────────────────────────────
+
+import json as _json
+
+def _extract_subtitle_text(msg) -> str:
+    text = getattr(msg, "text", None)
+    if not text:
+        trans = getattr(msg, "transcription", None)
+        if trans:
+            text = getattr(trans, "text", None)
+    return (text or "").strip()
+
+
+async def _broadcast_subtitle(stream_key: str, text: str, partial: bool = False) -> None:
+    payload = _json.dumps({"text": text, "partial": partial})
+    for q in list(_subtitle_queues.get(stream_key, [])):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+
+async def _run_transcription(stream_key: str) -> None:
+    """Run Palabra.ai transcription for the given stream via FFmpeg RTMP tap."""
+    try:
+        from palabra_ai import PalabraAI, Config, SourceLang, RunAsPipe
+    except ImportError:
+        log.warning("palabra-ai not installed — subtitles disabled (pip install palabra-ai)")
+        return
+
+    rtmp_url = f"rtmp://srs/live/{stream_key}"
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", rtmp_url,
+        "-vn",
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", "16000", "-ac", "1",
+        "-",
+    ]
+
+    async def on_transcript(msg):
+        text = _extract_subtitle_text(msg)
+        if text:
+            await _broadcast_subtitle(stream_key, text, partial=False)
+
+    try:
+        # PalabraAI() reads PALABRA_CLIENT_ID / PALABRA_CLIENT_SECRET from env
+        os.environ.setdefault("PALABRA_CLIENT_ID",     PALABRA_CLIENT_ID)
+        os.environ.setdefault("PALABRA_CLIENT_SECRET", PALABRA_CLIENT_SECRET)
+
+        palabra = PalabraAI()
+
+        # Resolve language constant (e.g. "en" → EN)
+        import palabra_ai as _pa_mod
+        lang = getattr(_pa_mod, PALABRA_SOURCE_LANG.upper(), PALABRA_SOURCE_LANG)
+
+        cfg = Config(
+            source=SourceLang(lang, RunAsPipe(ffmpeg_cmd), on_transcription=on_transcript),
+            targets=[],
+        )
+        log.info(f"Subtitle transcription started: {stream_key} lang={PALABRA_SOURCE_LANG}")
+        await palabra.arun(cfg)
+    except asyncio.CancelledError:
+        log.info(f"Subtitle transcription cancelled: {stream_key}")
+    except Exception as e:
+        log.error(f"Subtitle transcription error for {stream_key}: {e}")
+
+
+def subtitle_start(stream_key: str) -> None:
+    if not PALABRA_CLIENT_ID or not PALABRA_CLIENT_SECRET:
+        return
+    subtitle_stop(stream_key)  # cancel stale task if any
+    task = asyncio.create_task(_run_transcription(stream_key))
+    _subtitle_tasks[stream_key] = task
+
+
+def subtitle_stop(stream_key: str) -> None:
+    task = _subtitle_tasks.pop(stream_key, None)
+    if task and not task.done():
+        task.cancel()
+    for q in list(_subtitle_queues.pop(stream_key, [])):
+        try:
+            q.put_nowait(None)  # sentinel → close SSE connections
+        except asyncio.QueueFull:
+            pass
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -1041,6 +1139,7 @@ async def on_publish(request: Request):
         session_dvr_pending[stream_key] = session_dvr_pending.get(stream_key, 0) + 1
 
         asyncio.create_task(r_stream_resume(stream_key, client_id, username, recon["started_at"]))
+        subtitle_start(stream_key)
 
         log.info(
             f"Stream RECONNECTED (grace window): {stream_key} by '{username}' "
@@ -1119,6 +1218,7 @@ async def on_publish(request: Request):
         "srs_client_id": client_id,
     })
 
+    subtitle_start(stream_key)
     return srs_ok()
 
 
@@ -1922,6 +2022,50 @@ async def stream_stats(stream_key: str, _: None = Depends(require_api_key)):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.get("/subtitles")
+async def subtitles_sse(token: str):
+    """
+    SSE endpoint — viewer subscribes with their player token, receives real-time
+    subtitle lines as 'data: {"text": "...", "partial": false}' events.
+    Accessible at /api/subtitles?token=... through Caddy.
+    """
+    entry = viewer_tokens.get(token)
+    if not entry or entry["expires_at"] < time.time():
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+    stream_key = entry["stream_key"]
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _subtitle_queues.setdefault(stream_key, []).append(q)
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    yield "event: ping\ndata: {}\n\n"
+                    continue
+                if item is None:
+                    yield "event: end\ndata: {}\n\n"
+                    return
+                yield f"data: {item}\n\n"
+        finally:
+            qs = _subtitle_queues.get(stream_key, [])
+            try:
+                qs.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":      "no-cache",
+            "X-Accel-Buffering":  "no",
+        },
+    )
 
 
 @app.get("/health")

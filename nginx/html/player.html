@@ -19,11 +19,28 @@
   #unmute-overlay svg { width: 56px; height: 56px; fill: #fff; opacity: 0.9; }
   #unmute-overlay span { font-size: 15px; color: #fff; opacity: 0.85; }
   #unmute-overlay.hidden { display: none; }
+  #subtitle-bar {
+    position: absolute; bottom: 48px; left: 50%; transform: translateX(-50%);
+    max-width: 85%; background: rgba(0,0,0,0.78); color: #fff;
+    font-size: 17px; line-height: 1.45; padding: 5px 14px;
+    border-radius: 4px; text-align: center; pointer-events: none;
+    display: none; transition: opacity 0.35s;
+  }
+  #cc-btn {
+    position: absolute; bottom: 10px; right: 10px;
+    background: rgba(0,0,0,0.55); color: #fff;
+    border: 1px solid rgba(255,255,255,0.35); border-radius: 4px;
+    padding: 3px 8px; font-size: 12px; cursor: pointer; z-index: 10;
+    user-select: none;
+  }
+  #cc-btn.cc-off { opacity: 0.45; text-decoration: line-through; }
 </style>
 </head>
 <body>
 <div class="player-wrap">
   <video id="video" autoplay playsinline muted></video>
+  <div id="subtitle-bar"></div>
+  <button id="cc-btn" title="Toggle subtitles">CC</button>
   <div id="unmute-overlay" class="hidden">
     <!-- Speaker icon -->
     <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -213,6 +230,54 @@
   });
 
   connect();
+
+  // ── Subtitles ──────────────────────────────────────────────────────────────
+  var subtitleEl   = document.getElementById('subtitle-bar');
+  var ccBtn        = document.getElementById('cc-btn');
+  var ccEnabled    = true;
+  var hideTimer    = null;
+  var evtSource    = null;
+
+  function showSubtitle(text) {
+    if (!ccEnabled || !text) return;
+    subtitleEl.textContent = text;
+    subtitleEl.style.display = 'block';
+    subtitleEl.style.opacity = '1';
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      subtitleEl.style.opacity = '0';
+      setTimeout(function () { subtitleEl.style.display = 'none'; }, 350);
+    }, 4000);
+  }
+
+  ccBtn.addEventListener('click', function () {
+    ccEnabled = !ccEnabled;
+    ccBtn.classList.toggle('cc-off', !ccEnabled);
+    if (!ccEnabled) {
+      clearTimeout(hideTimer);
+      subtitleEl.style.display = 'none';
+    }
+  });
+
+  function connectSubtitles() {
+    if (evtSource) { evtSource.close(); evtSource = null; }
+    evtSource = new EventSource('/api/subtitles?token=' + encodeURIComponent(token));
+
+    evtSource.onmessage = function (e) {
+      try {
+        var d = JSON.parse(e.data);
+        if (d.text) showSubtitle(d.text);
+      } catch (_) {}
+    };
+
+    evtSource.addEventListener('end', function () {
+      evtSource.close(); evtSource = null;
+    });
+
+    // SSE reconnects automatically on error — no manual retry needed
+  }
+
+  connectSubtitles();
 })();
 </script>
 </body>

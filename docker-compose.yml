@@ -50,6 +50,9 @@ services:
       - VIEWER_TOKEN_API_KEY=${VIEWER_TOKEN_API_KEY:-}
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
       - SRS_NODES=http://srs:1985,http://srs-edge1:1985,http://srs-edge2:1985,http://srs-edge3:1985
+      - PALABRA_CLIENT_ID=${PALABRA_CLIENT_ID:-}
+      - PALABRA_CLIENT_SECRET=${PALABRA_CLIENT_SECRET:-}
+      - PALABRA_SOURCE_LANG=${PALABRA_SOURCE_LANG:-en}
     ulimits:
       nofile:
         soft: 100000
