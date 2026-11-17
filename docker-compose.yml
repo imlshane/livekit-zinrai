@@ -50,6 +50,9 @@ services:
       - VIEWER_TOKEN_API_KEY=${VIEWER_TOKEN_API_KEY:-}
       - SRS_PUBLIC_HOST=${SRS_PUBLIC_HOST:-livestream.zinrai.live}
       - SRS_NODES=http://srs:1985,http://srs-edge1:1985,http://srs-edge2:1985,http://srs-edge3:1985
+      - CAPTION_SECRET=${CAPTION_SECRET:-}
+      - CAPTIONS_URL=${CAPTIONS_URL:-http://captions:8000}   # set empty to disable captions
+      - LIBRETRANSLATE_URL=http://libretranslate:5000
     ulimits:
       nofile:
         soft: 100000
@@ -67,6 +70,37 @@ services:
       - auth-db:/data
       - ./dvr:/dvr
       - ./hls:/hls
+
+  captions:
+    build: ./captions
+    container_name: srs-captions
+    restart: unless-stopped
+    environment:
+      - SRS_HTTP_URL=http://srs:8080
+      - AUTH_URL=http://auth:8000
+      - CAPTION_SECRET=${CAPTION_SECRET:-}
+      - WHISPER_MODEL=${WHISPER_MODEL:-small}      # base = lighter/faster, medium = more accurate
+      - WHISPER_CPU_THREADS=${WHISPER_CPU_THREADS:-2}
+      - MAX_CONCURRENT_STREAMS=${CAPTION_MAX_STREAMS:-2}
+    mem_limit: 3g
+    memswap_limit: 3g
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    depends_on:
+      - srs
+      - auth
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    container_name: srs-libretranslate
+    restart: unless-stopped
+    environment:
+      - LT_LOAD_ONLY=${LT_LOAD_ONLY:-en,hi,ta,te,ml,kn,bn,mr,gu}
+      - LT_DISABLE_WEB_UI=true
+    mem_limit: 2g
+    memswap_limit: 2g
+    volumes:
+      - lt-models:/home/libretranslate/.local
 
   srs-edge1:
     image: ossrs/srs:v6
@@ -169,6 +203,8 @@ volumes:
   auth-db:
   caddy-data:     # TLS certificates — persists across container restarts
   caddy-config:
+  whisper-models:  # faster-whisper model cache
+  lt-models:       # LibreTranslate language models
 
 networks:
   default:

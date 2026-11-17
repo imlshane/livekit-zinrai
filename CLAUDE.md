@@ -40,6 +40,8 @@ ssh root@104.131.166.150 "cd /opt/livekit && git pull && docker compose up -d --
 | `srs-auth` | FastAPI auth + webhook callbacks (Python) |
 | `srs-origin` | SRS media server (RTMP ingest, WebRTC, DVR) |
 | `srs-caddy` | Caddy reverse proxy + automatic TLS |
+| `srs-captions` | Live speech-to-text (faster-whisper) → cues to auth |
+| `srs-libretranslate` | Caption translation (open source) |
 
 ## Key Env Vars (set in `/opt/live/.env`)
 
@@ -49,6 +51,8 @@ ssh root@104.131.166.150 "cd /opt/livekit && git pull && docker compose up -d --
 - `RECONNECT_GRACE_SEC` — seconds to hold session open after drop (default 30)
 - `RECORD_URL` / `RECORD_API_KEY` — recordings platform integration
 - `REDIS_URL` — stream analytics
+- `CAPTION_SECRET` — shared secret between auth ↔ captions (required for live captions)
+- `WHISPER_MODEL` (default `small`), `CAPTION_MAX_STREAMS`, `LT_LOAD_ONLY` — captions tuning
 
 ## Branch Strategy
 

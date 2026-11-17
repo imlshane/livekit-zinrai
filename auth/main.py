@@ -19,6 +19,8 @@ Management APIs (GET/POST):
 """
 
 import asyncio
+import collections
+import json
 import logging
 import os
 import secrets
@@ -32,7 +34,7 @@ from typing import Optional
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -137,6 +139,11 @@ MAX_PUBLISHERS          = 6
 MAX_STREAM_DURATION_SEC = 7200   # 2 hours — hard stop
 STREAM_WARN_BEFORE_SEC  = 600    # warn 10 minutes before hard stop
 TOKEN_TTL               = 7200   # seconds — matches 2h max stream duration
+
+# Live captions — captions service pushes cues here; viewers subscribe via SSE
+CAPTION_SECRET     = os.environ.get("CAPTION_SECRET", "")
+CAPTIONS_URL       = os.environ.get("CAPTIONS_URL", "").rstrip("/")          # e.g. http://captions:8000 (empty = disabled)
+LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "").rstrip("/")   # e.g. http://libretranslate:5000
 RECONNECT_GRACE_SEC     = int(os.environ.get("RECONNECT_GRACE_SEC", "30"))  # window to treat a reconnect as session resume
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1024,6 +1031,9 @@ async def on_publish(request: Request):
     username = educator.get("name", stream_key)
     log.info(f"Educator validated: '{username}' (id={educator.get('id')})")
 
+    # Start live captioning (idempotent; never blocks or fails the publish)
+    asyncio.create_task(_captions_start(stream_key))
+
     # ── Reconnect within grace window — resume the same session ─────────────────
     recon = pending_reconnect.pop(stream_key, None)
     if recon:
@@ -1179,6 +1189,12 @@ async def on_play(request: Request):
     log.info(f"on_play: stream={stream_key} param={param} client={client_id}")
 
     qs    = urllib.parse.parse_qs(param.lstrip("?"))
+
+    # Internal pull by the captions service — no viewer tracking
+    internal = qs.get("internal", [None])[0]
+    if internal and CAPTION_SECRET and secrets.compare_digest(internal, CAPTION_SECRET):
+        return srs_ok()
+
     token = qs.get("token", [None])[0]
 
     if not token:
@@ -1753,6 +1769,108 @@ async def webrtc_play(body: PlayRequest, request: Request):
 
     log.info(f"WebRTC play proxied: stream={stream_key} ip={client_ip} sid={sid}")
     return {"sdp": result["sdp"]}
+
+
+# ── Live captions ─────────────────────────────────────────────────────────────
+
+caption_subs:    dict[str, set] = {}                      # stream_key → {asyncio.Queue}
+_translate_cache: "collections.OrderedDict[tuple, str]" = collections.OrderedDict()
+_lt_languages: Optional[list] = None
+
+
+async def _captions_start(stream_key: str) -> None:
+    if not CAPTIONS_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(f"{CAPTIONS_URL}/start", json={"stream_key": stream_key})
+    except Exception as e:
+        log.warning(f"captions start failed stream={stream_key}: {e}")
+
+
+async def _translate(cue_id: int, text: str, src: str, target: str) -> str:
+    key = (cue_id, target)
+    if key in _translate_cache:
+        return _translate_cache[key]
+    if not LIBRETRANSLATE_URL or src == target:
+        return text
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(f"{LIBRETRANSLATE_URL}/translate",
+                                  json={"q": text, "source": src or "auto", "target": target, "format": "text"})
+        out = r.json().get("translatedText") or text
+    except Exception as e:
+        log.warning(f"translate failed target={target}: {e}")
+        return text
+    _translate_cache[key] = out
+    while len(_translate_cache) > 2000:
+        _translate_cache.popitem(last=False)
+    return out
+
+
+@app.post("/internal/caption")
+async def internal_caption(request: Request):
+    if not CAPTION_SECRET or not secrets.compare_digest(
+            request.headers.get("x-internal-secret", ""), CAPTION_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    cue = await request.json()
+    key = cue.get("stream_key", "")
+    if not key or not cue.get("text"):
+        raise HTTPException(status_code=400, detail="Bad cue")
+    for q in list(caption_subs.get(key, ())):
+        if q.qsize() < 50:
+            q.put_nowait(cue)
+    return {"ok": True}
+
+
+@app.get("/captions/languages")
+async def caption_languages():
+    global _lt_languages
+    if _lt_languages is None and LIBRETRANSLATE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{LIBRETRANSLATE_URL}/languages")
+            _lt_languages = [{"code": l["code"], "name": l["name"]} for l in r.json()]
+        except Exception as e:
+            log.warning(f"languages fetch failed: {e}")
+    return {"languages": _lt_languages or []}
+
+
+@app.get("/captions/stream")
+async def caption_stream(token: str, lang: str = "orig"):
+    entry = viewer_tokens.get(token)
+    if not entry or entry["expires_at"] < time.time():
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    if not lang.replace("-", "").isalpha() or len(lang) > 8:
+        raise HTTPException(status_code=400, detail="Bad lang")
+    stream_key = entry["stream_key"]
+
+    async def gen():
+        q: asyncio.Queue = asyncio.Queue()
+        caption_subs.setdefault(stream_key, set()).add(q)
+        try:
+            yield "retry: 3000\n\n"
+            while True:
+                try:
+                    cue = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    if entry["expires_at"] < time.time():
+                        return
+                    yield ": ping\n\n"
+                    continue
+                text = cue["text"]
+                if lang != "orig":
+                    text = await _translate(cue["id"], text, cue.get("lang", ""), lang)
+                yield "data: " + json.dumps({"id": cue["id"], "text": text, "lang": cue.get("lang")}) + "\n\n"
+        finally:
+            subs = caption_subs.get(stream_key)
+            if subs:
+                subs.discard(q)
+                if not subs:
+                    caption_subs.pop(stream_key, None)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Management APIs ───────────────────────────────────────────────────────────

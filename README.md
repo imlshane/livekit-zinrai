@@ -319,3 +319,20 @@ docker run -d --name srs-edge \
 ```
 
 Point your load balancer at all edge nodes. Viewers connect to any edge; origin handles all publishing.
+
+---
+
+## Live Captions & Translation
+
+Open-source, self-hosted: **faster-whisper** transcribes the live audio (language auto-detected),
+**LibreTranslate** translates on demand. Viewers toggle **CC** and pick a language in `player.html`.
+
+Flow: `on_publish` → auth tells `captions` to start → captions pulls audio from SRS (HTTP-FLV,
+`?internal=$CAPTION_SECRET`) → cues POSTed to auth `/internal/caption` → fanned out over SSE
+(`/api/captions/stream?token=&lang=`), translated once per cue+language and cached.
+
+Setup: set `CAPTION_SECRET` in `.env` (any long random string), then
+`docker compose up -d --build captions libretranslate auth caddy`. Set `CAPTIONS_URL=` (empty) to disable.
+
+Captions trail the speaker by ~2–5s. Whisper `small` needs ~2 vCPU per concurrent stream; use
+`WHISPER_MODEL=base` on small servers.

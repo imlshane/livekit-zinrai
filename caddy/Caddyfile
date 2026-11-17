@@ -56,6 +56,14 @@
         reverse_proxy srs:1985
     }
 
+    # ── Live caption SSE — must not be buffered ─────────────────────────────
+    handle /api/captions/stream {
+        uri strip_prefix /api
+        reverse_proxy auth:8000 {
+            flush_interval -1
+        }
+    }
+
     # ── Auth service API  /api/... → auth:8000/... ───────────────────────────
     handle /api/* {
         @preflight method OPTIONS
